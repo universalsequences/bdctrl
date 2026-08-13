@@ -94,9 +94,9 @@ final class MetalCanvasView: MTKView {
         window?.makeFirstResponder(self)
         let world = worldPoint(event); lastDragWorld = world
         if let id = hitNode(world) {
-            model?.select(id); model?.layout?.pin(id); drag = .node(id)
+            model?.select(id); model?.layout?.pin(id); renderer?.isManipulatingGeometry = true; drag = .node(id)
         } else if let id = hitEpic(world) {
-            model?.select(id); model?.layout?.freeze(); drag = .epic(id)
+            model?.select(id); model?.layout?.freeze(); renderer?.isManipulatingGeometry = true; drag = .epic(id)
             if event.clickCount == 2 { zoomToEpic(id) }
         } else { model?.select(nil); drag = .pan }
     }
@@ -117,6 +117,7 @@ final class MetalCanvasView: MTKView {
     override func mouseUp(with event: NSEvent) {
         if case .node(let id) = drag { model?.layout?.unpin(id) }
         if case .epic = drag { model?.layout?.persist() }
+        renderer?.isManipulatingGeometry = false
         drag = .none
     }
 

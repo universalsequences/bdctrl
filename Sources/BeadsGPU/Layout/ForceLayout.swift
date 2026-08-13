@@ -11,6 +11,7 @@ final class ForceLayout {
     private let storageURL: URL
     private var saveCounter = 0
     private var settleFrames = 0
+    var isSettling: Bool { settleFrames > 0 }
     private var layoutSignature = ""
 
     init(projectURL: URL) {

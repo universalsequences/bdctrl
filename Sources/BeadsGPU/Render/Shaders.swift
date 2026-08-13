@@ -124,12 +124,31 @@ enum BeadShaders {
     }
 
     // ---------------------------------------------------------------- blobs
-    struct Blob { float2 center; float2 size; float4 color; uint flags; uint start; uint count; uint pad; };
+    struct Blob {
+        float2 center;
+        float2 size;
+        float4 palette0;
+        float4 palette1;
+        float4 palette2;
+        float4 palette3;
+        float seed;
+        uint flags;
+        uint style;
+        uint start;
+        uint count;
+        uint padding0;
+        uint padding1;
+    };
     struct BlobOut {
         float4 position [[position]];
         float2 world;
-        float4 color;
+        float4 palette0 [[flat]];
+        float4 palette1 [[flat]];
+        float4 palette2 [[flat]];
+        float4 palette3 [[flat]];
+        float seed [[flat]];
         uint flags [[flat]];
+        uint style [[flat]];
         uint start [[flat]];
         uint count [[flat]];
         float time;
@@ -142,7 +161,10 @@ enum BeadShaders {
         float2 world = b.center + uv * b.size * 0.5;
         BlobOut o;
         o.position = float4(toClip(world, view), 0, 1);
-        o.world = world; o.color = b.color; o.flags = b.flags;
+        o.world = world;
+        o.palette0 = b.palette0; o.palette1 = b.palette1;
+        o.palette2 = b.palette2; o.palette3 = b.palette3;
+        o.seed = b.seed; o.flags = b.flags; o.style = b.style;
         o.start = b.start; o.count = b.count; o.time = view.time;
         return o;
     }
@@ -161,22 +183,120 @@ enum BeadShaders {
         return s * sqrt(d);
     }
 
+    static float blobHash(float2 p) {
+        p = fract(p * float2(123.34, 456.21));
+        p += dot(p, p + 45.32);
+        return fract(p.x * p.y);
+    }
+
+    static float blobNoise(float2 p) {
+        float2 i = floor(p), f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(blobHash(i), blobHash(i + float2(1, 0)), f.x),
+                   mix(blobHash(i + float2(0, 1)), blobHash(i + 1.0), f.x), f.y);
+    }
+
+    static float blobFBM(float2 p) {
+        float value = 0.0, amplitude = 0.5;
+        for (uint octave = 0; octave < 3; octave++) {
+            value += amplitude * blobNoise(p);
+            p = float2(1.62 * p.x - 1.17 * p.y, 1.17 * p.x + 1.62 * p.y) + 7.13;
+            amplitude *= 0.5;
+        }
+        return value;
+    }
+
+    static float3 blobPalette(BlobOut in, float t) {
+        t = clamp(t, 0.0, 0.999);
+        if (t < 0.333) return mix(in.palette0.rgb, in.palette1.rgb, smoothstep(0.0, 0.333, t));
+        if (t < 0.666) return mix(in.palette1.rgb, in.palette2.rgb, smoothstep(0.333, 0.666, t));
+        return mix(in.palette2.rgb, in.palette3.rgb, smoothstep(0.666, 1.0, t));
+    }
+
+    static float blobPattern(BlobOut in) {
+        float2 p = in.world / 105.0 + float2(in.seed * 17.0, in.seed * -11.0);
+        float n = blobFBM(p * 1.15);
+        switch (in.style) {
+            case 0u: // Slowly flowing, domain-warped ribbons.
+                return 0.5 + 0.5 * sin((p.x + p.y * 0.42 + n * 1.8) * 3.1 + in.time * 0.055);
+            case 1u: { // Soft mineral/cellular pools.
+                float cells = blobNoise(p * 3.0 + n * 1.4);
+                return smoothstep(0.12, 0.90, cells * 0.72 + n * 0.42);
+            }
+            case 2u: { // Offset radial color blooms.
+                float2 origin = float2(sin(in.seed * 31.0), cos(in.seed * 23.0)) * 0.8;
+                return fract(length(p - origin) * 0.48 - n * 0.55 + in.seed);
+            }
+            default: // Topographic bands softened by noise.
+                return smoothstep(0.12, 0.88, 0.5 + 0.5 * sin((n * 4.2 + p.y) * 4.0));
+        }
+    }
+
     fragment float4 blobFragment(BlobOut in [[stage_in]], constant float2 *pts [[buffer(0)]]) {
         float d = sdPolygon(in.world, pts, in.start, in.count);
         float aa = max(fwidth(d), 0.001);
+        // Skip procedural noise for transparent corners of the bounding quad.
+        if (d > 78.0) discard_fragment();
         float shell = 1.0 - smoothstep(1.1, 1.1 + aa * 2.0, abs(d));
         float fill = 1.0 - smoothstep(-aa, aa, d);
         float halo = exp(-max(d, 0.0) / 30.0) * 0.05;
 
-        // Slight iridescent tint that follows the contour normal.
+        float pattern = blobPattern(in);
+        float3 artColor = blobPalette(in, pattern);
+        // Light from the upper left gives the otherwise-flat artwork a little
+        // depth while leaving the triangle mesh free to add structure.
         float2 g = normalize(float2(dfdx(d), dfdy(d)) + float2(1e-5, 0.0));
-        float3 shellColor = mix(in.color.rgb, float3(0.82, 0.78, 0.94), saturate(0.5 - 0.5 * g.y) * 0.55);
-        float pulse = (in.flags & 1u) ? (0.9 + 0.28 * sin(in.time * 1.1)) : 0.9;
+        float edgeLight = saturate(0.58 - 0.42 * dot(g, normalize(float2(0.6, 0.8))));
+        float3 shellColor = mix(artColor, float3(0.90, 0.86, 1.0), edgeLight * 0.62);
+        float pulse = (in.flags & 1u) ? (0.96 + 0.22 * sin(in.time * 1.1)) : 0.94;
 
-        float3 c = mix(in.color.rgb * 0.85, shellColor * pulse * 1.25, saturate(shell));
-        float a = max(shell * 0.85, fill * 0.055) + halo;
+        float3 c = mix(artColor * (0.62 + 0.18 * edgeLight), shellColor * pulse * 1.18, saturate(shell));
+        float a = max(shell * 0.88, fill * 0.22) + halo;
         if (a < 0.004) discard_fragment();
         return float4(c, a);
+    }
+
+    // ------------------------------------------------------- triangulated fill
+    struct BlobMeshV {
+        float2 position;
+        float2 padding0;
+        float3 barycentric;
+        float tone;
+        float lineStrength;
+        float2 padding1;
+        float4 color;
+    };
+    struct BlobMeshOut {
+        float4 position [[position]];
+        float3 barycentric;
+        float tone [[flat]];
+        float lineStrength [[flat]];
+        float4 color [[flat]];
+    };
+
+    vertex BlobMeshOut blobMeshVertex(uint i [[vertex_id]],
+                                      constant BlobMeshV *vertices [[buffer(0)]],
+                                      constant View &view [[buffer(1)]]) {
+        BlobMeshV v = vertices[i];
+        BlobMeshOut o;
+        o.position = float4(toClip(v.position, view), 0, 1);
+        o.barycentric = v.barycentric;
+        o.tone = v.tone;
+        o.lineStrength = v.lineStrength;
+        o.color = v.color;
+        return o;
+    }
+
+    fragment float4 blobMeshFragment(BlobMeshOut in [[stage_in]]) {
+        float edgeDistance = min(in.barycentric.x, min(in.barycentric.y, in.barycentric.z));
+        float edgeWidth = max(fwidth(edgeDistance) * 1.15, 0.0008);
+        float line = 1.0 - smoothstep(0.15 * edgeWidth, 1.25 * edgeWidth, edgeDistance);
+        // Facets now provide the fill directly; avoiding the old bounding-quad
+        // polygon/noise shader removes its expensive per-pixel edge loop.
+        float alpha = 0.24 + line * 0.34 * in.lineStrength;
+        float3 color = mix(in.color.rgb * (0.52 + in.tone * 0.24),
+                           mix(in.color.rgb, float3(0.94), 0.46), line);
+        return float4(color, alpha);
     }
 
     // ---------------------------------------------------------------- labels

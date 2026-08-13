@@ -5,7 +5,7 @@ import simd
 /// (marching squares → Chaikin smoothing). Same field as hit-testing, so what
 /// you see is exactly what you can click.
 enum BlobContour {
-    static func loops(field: BlobField, cell: Float = 11, maxPoints: Int = 96) -> [[SIMD2<Float>]] {
+    static func loops(field: BlobField, cell: Float = 11, maxPoints: Int = 64) -> [[SIMD2<Float>]] {
         let centers = field.centers
         guard !centers.isEmpty else { return [] }
         var lo = centers[0], hi = centers[0]
