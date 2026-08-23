@@ -259,19 +259,14 @@ enum BeadShaders {
     // ------------------------------------------------------- triangulated fill
     struct BlobMeshV {
         float2 position;
-        float2 padding0;
-        float3 barycentric;
         float tone;
-        float lineStrength;
-        float2 padding1;
+        float padding0;
         float4 color;
     };
     struct BlobMeshOut {
         float4 position [[position]];
-        float3 barycentric;
-        float tone [[flat]];
-        float lineStrength [[flat]];
-        float4 color [[flat]];
+        float tone;
+        float4 color;
     };
 
     vertex BlobMeshOut blobMeshVertex(uint i [[vertex_id]],
@@ -280,22 +275,17 @@ enum BeadShaders {
         BlobMeshV v = vertices[i];
         BlobMeshOut o;
         o.position = float4(toClip(v.position, view), 0, 1);
-        o.barycentric = v.barycentric;
         o.tone = v.tone;
-        o.lineStrength = v.lineStrength;
         o.color = v.color;
         return o;
     }
 
     fragment float4 blobMeshFragment(BlobMeshOut in [[stage_in]]) {
-        float edgeDistance = min(in.barycentric.x, min(in.barycentric.y, in.barycentric.z));
-        float edgeWidth = max(fwidth(edgeDistance) * 1.15, 0.0008);
-        float line = 1.0 - smoothstep(0.15 * edgeWidth, 1.25 * edgeWidth, edgeDistance);
-        // Facets now provide the fill directly; avoiding the old bounding-quad
-        // polygon/noise shader removes its expensive per-pixel edge loop.
-        float alpha = 0.24 + line * 0.34 * in.lineStrength;
-        float3 color = mix(in.color.rgb * (0.52 + in.tone * 0.24),
-                           mix(in.color.rgb, float3(0.94), 0.46), line);
+        // Tone and color interpolate across each facet (no [[flat]]), so the
+        // mesh shades as one continuous gradient; the dense rim glows slightly
+        // brighter and more opaque than the broad interior.
+        float alpha = 0.22 + in.tone * 0.16;
+        float3 color = in.color.rgb * (0.52 + in.tone * 0.30);
         return float4(color, alpha);
     }
 

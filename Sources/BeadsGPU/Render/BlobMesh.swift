@@ -8,10 +8,22 @@ enum BlobMesh {
         let a: SIMD2<Float>
         let b: SIMD2<Float>
         let c: SIMD2<Float>
-        let tone: Float
+        /// Per-vertex tones. Shared vertices carry identical tones across all
+        /// incident triangles, so interpolated shading is continuous over the
+        /// whole mesh instead of stepping per facet.
+        let toneA: Float
+        let toneB: Float
+        let toneC: Float
     }
 
-    static func triangles(loop: [SIMD2<Float>], seed: UInt64, maxPoints: Int = 150) -> [Triangle] {
+    /// Spacing of resampled boundary points; rim triangles are roughly this size.
+    private static let boundarySpacing: Float = 9
+    /// Exclusion radius at the boundary and its exponential growth length.
+    private static let rimRadius: Float = 8
+    private static let radiusFalloff: Float = 42
+    private static let maxRadius: Float = 64
+
+    static func triangles(loop: [SIMD2<Float>], seed: UInt64, maxPoints: Int = 320) -> [Triangle] {
         guard loop.count >= 3 else { return [] }
         var lo = loop[0], hi = loop[0]
         for p in loop { lo = min(lo, p); hi = max(hi, p) }
@@ -19,18 +31,32 @@ enum BlobMesh {
         guard extent.x > 1, extent.y > 1 else { return [] }
 
         var rng = SplitMix64(seed: seed)
-        var points = loop
+        // A dense, jittered boundary gives the small rim triangles their scale;
+        // the coarse contour loop alone would cap rim density at its own spacing.
+        var points = resample(loop, spacing: boundarySpacing, rng: &rng)
+        let boundaryCount = points.count
         var interior: [(point: SIMD2<Float>, radius: Float)] = []
-        let attempts = min(8_000, max(1_200, maxPoints * 32))
+        let attempts = min(14_000, max(2_000, maxPoints * 40))
 
-        // Variable-radius dart throwing: points close to the boundary may pack
-        // tightly, while points deep inside require more room around them.
-        for _ in 0..<attempts where points.count < maxPoints {
-            let p = lo + SIMD2(rng.unitFloat() * extent.x, rng.unitFloat() * extent.y)
+        // Variable-radius dart throwing: the exclusion radius grows exponentially
+        // with distance from the boundary, so points pack tightly along the rim
+        // and thin out into broad central facets. Uniform proposals rarely land
+        // in the thin rim band, so most darts are aimed inward from a random
+        // boundary point with an exponentially distributed inset.
+        for _ in 0..<attempts where interior.count < maxPoints {
+            var p: SIMD2<Float>
+            if rng.unitFloat() < 0.7 {
+                let at = points[Int(rng.unitFloat() * Float(boundaryCount)) % boundaryCount]
+                let angle = rng.unitFloat() * 2 * Float.pi
+                let inset = -radiusFalloff * 1.3 * log(max(1e-6, 1 - rng.unitFloat()))
+                p = at + SIMD2(cos(angle), sin(angle)) * (5 + inset)
+            } else {
+                p = lo + SIMD2(rng.unitFloat() * extent.x, rng.unitFloat() * extent.y)
+            }
             guard contains(p, polygon: loop) else { continue }
             let edgeDistance = distanceToBoundary(p, polygon: loop)
-            guard edgeDistance > 8 else { continue }
-            let radius = min(58, 25 + edgeDistance * 0.24)
+            guard edgeDistance > boundarySpacing * 0.55 else { continue }
+            let radius = min(maxRadius, rimRadius * exp(edgeDistance / radiusFalloff))
             var accepted = true
             for sample in interior {
                 let separation = max(radius, sample.radius)
@@ -45,16 +71,27 @@ enum BlobMesh {
             }
         }
 
+        // Tone per point, not per triangle: bright along the dense rim and
+        // falling off smoothly with depth, plus a little hash noise so the
+        // gradient stays organic. Shared vertices make the shading continuous.
+        var tones = [Float](repeating: 0, count: points.count)
+        for index in points.indices {
+            let depth = index < boundaryCount ? 0 : distanceToBoundary(points[index], polygon: loop)
+            var noise = SplitMix64(seed: seed &+ UInt64(index) &* 0x9e3779b97f4a7c15)
+            tones[index] = min(1, exp(-depth / (radiusFalloff * 1.4)) * 0.88 + noise.unitFloat() * 0.16)
+        }
+
         let indexed = delaunay(points)
         var result: [Triangle] = []
         result.reserveCapacity(indexed.count)
-        for (ordinal, triangle) in indexed.enumerated() {
+        for triangle in indexed {
             let a = points[triangle.a], b = points[triangle.b], c = points[triangle.c]
             guard abs(cross(b - a, c - a)) > 0.01 else { continue }
             // An unconstrained Delaunay edge can bridge a concavity. Sampling
-            // each edge plus the centroid removes those triangles; the SDF fill
-            // beneath the mesh hides any sub-pixel slivers this conservative
-            // clipping leaves at the contour.
+            // each edge plus the centroid removes those triangles. Rim
+            // triangles legitimately graze just outside the smoothed polygon,
+            // so allow a few pixels of tolerance — only samples well outside
+            // the contour (true concavity bridges) cull the triangle.
             let centroid: SIMD2<Float> = (a + b + c) / Float(3)
             let ab: SIMD2<Float> = (a + b) / Float(2)
             let bc: SIMD2<Float> = (b + c) / Float(2)
@@ -63,9 +100,14 @@ enum BlobMesh {
                                            a * 0.75 + b * 0.25,
                                            b * 0.75 + c * 0.25,
                                            c * 0.75 + a * 0.25]
-            guard samples.allSatisfy({ contains($0, polygon: loop) }) else { continue }
-            var toneRNG = SplitMix64(seed: seed &+ UInt64(ordinal) &* 0x9e3779b97f4a7c15)
-            result.append(Triangle(a: a, b: b, c: c, tone: toneRNG.unitFloat()))
+            let insideEnough: (SIMD2<Float>) -> Bool = {
+                contains($0, polygon: loop) || distanceToBoundary($0, polygon: loop) < 3.5
+            }
+            guard samples.allSatisfy(insideEnough) else { continue }
+            result.append(Triangle(a: a, b: b, c: c,
+                                   toneA: tones[triangle.a],
+                                   toneB: tones[triangle.b],
+                                   toneC: tones[triangle.c]))
         }
         return result
     }
@@ -88,6 +130,32 @@ enum BlobMesh {
             j = i
         }
         return inside
+    }
+
+    /// Arc-length resampling of the contour loop with per-step jitter, so rim
+    /// triangle edges vary in length instead of reading as a regular fringe.
+    private static func resample(_ loop: [SIMD2<Float>], spacing: Float,
+                                 rng: inout SplitMix64) -> [SIMD2<Float>] {
+        var perimeter: Float = 0
+        var previous = loop.last!
+        for p in loop { perimeter += simd_distance(previous, p); previous = p }
+        guard perimeter > spacing * 3 else { return loop }
+
+        var result: [SIMD2<Float>] = []
+        var next = spacing * (0.6 + 0.8 * rng.unitFloat())
+        var travelled: Float = 0
+        previous = loop.last!
+        for p in loop {
+            let length = simd_distance(previous, p)
+            while travelled + length >= next {
+                let t = (next - travelled) / max(1e-5, length)
+                result.append(previous + (p - previous) * t)
+                next += spacing * (0.6 + 0.8 * rng.unitFloat())
+            }
+            travelled += length
+            previous = p
+        }
+        return result.count >= 3 ? result : loop
     }
 
     private struct IndexTriangle { let a: Int; let b: Int; let c: Int }

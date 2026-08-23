@@ -2,6 +2,8 @@
 
 A Metal-native macOS viewer for [beads](https://github.com/steveyegge/beads) issue graphs.
 
+This repository also contains an experimental Bun/OpenTUI ready-work viewer and Herdr agent launcher in [`tui/`](tui/README.md).
+
 ## Run
 
 Requirements: macOS 14+, Xcode/Swift 6, and `bd` on `PATH`.

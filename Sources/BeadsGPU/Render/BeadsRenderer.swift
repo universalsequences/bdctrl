@@ -60,11 +60,8 @@ private struct EpicVisualStyle {
 
 private struct BlobMeshVertex {
     var position: SIMD2<Float>
-    var padding0: SIMD2<Float> = .zero
-    var barycentric: SIMD3<Float>
     var tone: Float
-    var lineStrength: Float
-    var padding1: SIMD2<Float> = .zero
+    var padding0: Float = 0
     var color: SIMD4<Float>
 }
 
@@ -348,16 +345,17 @@ final class BeadsRenderer: NSObject, MTKViewDelegate {
                                               pointStart: UInt32(points.count), pointCount: UInt32(loop.count)))
                 points += loop
 
-                let lineStrength: Float = hasReady ? 1.15 : (complete ? 0.72 : 0.92)
                 let triangles = meshTriangles.indices.contains(loopIndex) ? meshTriangles[loopIndex] : []
                 for triangle in triangles {
-                    let color = simd_mix(palette[1], palette[3], SIMD4<Float>(repeating: triangle.tone * 0.72))
-                    meshVertices.append(BlobMeshVertex(position: triangle.a, barycentric: SIMD3(1, 0, 0),
-                                                       tone: triangle.tone, lineStrength: lineStrength, color: color))
-                    meshVertices.append(BlobMeshVertex(position: triangle.b, barycentric: SIMD3(0, 1, 0),
-                                                       tone: triangle.tone, lineStrength: lineStrength, color: color))
-                    meshVertices.append(BlobMeshVertex(position: triangle.c, barycentric: SIMD3(0, 0, 1),
-                                                       tone: triangle.tone, lineStrength: lineStrength, color: color))
+                    // Color is resolved per vertex from its tone; the GPU
+                    // interpolates across the facet, so shading reads as one
+                    // continuous gradient over the mesh.
+                    for (position, tone) in [(triangle.a, triangle.toneA),
+                                             (triangle.b, triangle.toneB),
+                                             (triangle.c, triangle.toneC)] {
+                        let color = simd_mix(palette[1], palette[3], SIMD4<Float>(repeating: tone * 0.72))
+                        meshVertices.append(BlobMeshVertex(position: position, tone: tone, color: color))
+                    }
                 }
             }
         }
