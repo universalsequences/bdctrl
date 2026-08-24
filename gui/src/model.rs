@@ -77,6 +77,17 @@ pub struct DashboardData {
     pub epics: Vec<EpicSummary>,
     pub ungrouped: Vec<Issue>,
     pub states: HashMap<String, WorkState>,
+    // blocker id -> ids of the beads it blocks
+    pub dependents: HashMap<String, Vec<String>>,
+}
+
+// One row of the flattened blocks tree shown in the inspector: the prefix
+// carries the box-drawing glyphs so rendering is a plain list of lines.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlocksNode {
+    pub id: String,
+    pub prefix: String,
+    pub cycle: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -117,6 +128,7 @@ impl DashboardData {
             .collect();
         let mut parent_by_child = HashMap::<&str, &str>::new();
         let mut blockers = HashMap::<&str, Vec<&str>>::new();
+        let mut dependents = HashMap::<String, Vec<String>>::new();
         for issue in &issues {
             for dependency in &issue.dependencies {
                 if dependency.kind == "parent-child" {
@@ -129,6 +141,12 @@ impl DashboardData {
                         .entry(dependency.issue_id.as_str())
                         .or_default()
                         .push(dependency.depends_on_id.as_str());
+                    let blocked = dependents
+                        .entry(dependency.depends_on_id.clone())
+                        .or_default();
+                    if !blocked.contains(&dependency.issue_id) {
+                        blocked.push(dependency.issue_id.clone());
+                    }
                 }
             }
         }
@@ -225,6 +243,76 @@ impl DashboardData {
             epics,
             ungrouped,
             states,
+            dependents,
+        }
+    }
+
+    pub fn blocks_tree(&self, root: &str) -> Vec<BlocksNode> {
+        let mut nodes = Vec::new();
+        let children = self.sorted_dependents(root);
+        let ancestors = HashSet::from([root.to_owned()]);
+        for (index, child) in children.iter().enumerate() {
+            self.push_blocks_node(
+                child,
+                "",
+                index == children.len() - 1,
+                &ancestors,
+                &mut nodes,
+            );
+        }
+        nodes
+    }
+
+    // Open work first, then priority, then id — closed beads sink so the tree
+    // leads with what is still waiting.
+    fn sorted_dependents(&self, id: &str) -> Vec<String> {
+        let mut children = self.dependents.get(id).cloned().unwrap_or_default();
+        children.sort_by(|a, b| {
+            let left = self.issue(a);
+            let right = self.issue(b);
+            let rank = |issue: Option<&Issue>| {
+                (
+                    issue.is_some_and(|issue| issue.status == "closed"),
+                    issue.map_or(99, |issue| issue.priority),
+                )
+            };
+            rank(left).cmp(&rank(right)).then_with(|| a.cmp(b))
+        });
+        children
+    }
+
+    fn push_blocks_node(
+        &self,
+        id: &str,
+        prefix: &str,
+        last: bool,
+        ancestors: &HashSet<String>,
+        nodes: &mut Vec<BlocksNode>,
+    ) {
+        let cycle = ancestors.contains(id);
+        nodes.push(BlocksNode {
+            id: id.to_owned(),
+            prefix: format!("{prefix}{} ", if last { "└─" } else { "├─" }),
+            cycle,
+        });
+        if cycle {
+            return;
+        }
+        let children = self.sorted_dependents(id);
+        if children.is_empty() {
+            return;
+        }
+        let mut next_ancestors = ancestors.clone();
+        next_ancestors.insert(id.to_owned());
+        let next_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
+        for (index, child) in children.iter().enumerate() {
+            self.push_blocks_node(
+                child,
+                &next_prefix,
+                index == children.len() - 1,
+                &next_ancestors,
+                nodes,
+            );
         }
     }
 
@@ -284,5 +372,34 @@ mod tests {
         assert_eq!(data.epics[0].closed, 1);
         assert_eq!(data.state("b"), WorkState::Ready);
         assert_eq!(data.ungrouped[0].id, "c");
+    }
+
+    #[test]
+    fn blocks_tree_nests_sorts_and_flags_cycles() {
+        let raw = r#"
+{"id":"root","title":"Root","status":"open","priority":1,"issue_type":"task"}
+{"id":"closed","title":"Done","status":"closed","priority":0,"issue_type":"task","dependencies":[{"issue_id":"closed","depends_on_id":"root","type":"blocks"}]}
+{"id":"hot","title":"Hot","status":"open","priority":0,"issue_type":"task","dependencies":[{"issue_id":"hot","depends_on_id":"root","type":"blocks"}]}
+{"id":"leaf","title":"Leaf","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"leaf","depends_on_id":"hot","type":"blocks"},{"issue_id":"leaf","depends_on_id":"hot","type":"blocks"}]}
+"#;
+        let data = DashboardData::from_export(raw).unwrap();
+        let nodes = data.blocks_tree("root");
+        let rows: Vec<_> = nodes
+            .iter()
+            .map(|node| format!("{}{}", node.prefix, node.id))
+            .collect();
+        // Open beads first, closed last; leaf nests under hot exactly once.
+        assert_eq!(rows, vec!["├─ hot", "│  └─ leaf", "└─ closed"]);
+
+        let cyclic = DashboardData::from_export(
+            r#"
+{"id":"a","title":"A","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"a","depends_on_id":"b","type":"blocks"}]}
+{"id":"b","title":"B","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"b","depends_on_id":"a","type":"blocks"}]}
+"#,
+        )
+        .unwrap();
+        let nodes = cyclic.blocks_tree("a");
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes[1].cycle, "revisiting the root must stop the walk");
     }
 }

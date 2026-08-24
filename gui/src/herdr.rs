@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::Issue;
@@ -17,9 +18,13 @@ pub struct AgentInfo {
     pub name: String,
     pub kind: String,
     pub status: String,
+    // Live context size of the agent's session, when its harness exposes one
+    // (filled in by claude::attach_context for Claude sessions).
+    pub context_tokens: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     Pi,
     Claude,
@@ -147,6 +152,7 @@ pub fn discover_agents(issues: &[Issue], cwd: &Path) -> HashMap<String, AgentInf
                 name: name.into(),
                 kind: agent["agent"].as_str().unwrap_or("agent").into(),
                 status: agent["agent_status"].as_str().unwrap_or("unknown").into(),
+                context_tokens: None,
             },
         );
     }
@@ -162,17 +168,20 @@ pub fn read_agent_preview(name: &str, cwd: &Path) -> Result<Vec<String>> {
             "--source".into(),
             "recent-unwrapped".into(),
             "--lines".into(),
-            "16".into(),
+            "30".into(),
         ],
         cwd,
     )?;
     let mut lines = Vec::new();
     for line in raw.lines() {
-        let trimmed = line.trim();
+        let trimmed = line.trim().trim_matches('│').trim();
         if trimmed.is_empty()
-            || trimmed.chars().all(|character| "─━═- ".contains(character))
+            || trimmed
+                .chars()
+                .all(|character| "─━═-╭╮╰╯│┌┐└┘⎿ ".contains(character))
             || trimmed.starts_with("~/")
             || trimmed.starts_with("/home/")
+            || is_harness_chrome(trimmed)
         {
             continue;
         }
@@ -187,6 +196,25 @@ pub fn read_agent_preview(name: &str, cwd: &Path) -> Result<Vec<String>> {
         lines.drain(..lines.len() - 6);
     }
     Ok(lines)
+}
+
+// Terminal harnesses (Claude Code especially) fill the visible tail with
+// status chrome — spinner lines, footer tips, the input box — which drowns
+// out the transcript the preview is for.
+fn is_harness_chrome(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.starts_with("tip:")
+        || lower.starts_with("> ")
+        || lower == ">"
+        || lower.contains("to interrupt")
+        || lower.contains("update available")
+        || lower.contains("? for shortcuts")
+        || lower.contains("shift+tab to cycle")
+        || lower.contains("accept edits")
+        || lower.contains("bypass permissions")
+        || lower.contains("plan mode")
+        || lower.contains("tokens remaining")
+        || lower.contains("context left")
 }
 
 pub fn focus_agent(name: &str, cwd: &Path) -> Result<()> {
@@ -321,7 +349,20 @@ fn run_herdr(args: &[String], cwd: &Path) -> Result<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        bail!("{}", if stderr.is_empty() { stdout } else { stderr });
+        let raw = if stderr.is_empty() { stdout } else { stderr };
+        // herdr reports failures as {"error":{"code","message"}} JSON; keep the
+        // code in front so retry_start can still match on it.
+        let message = serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|value| {
+                let code = value["error"]["code"].as_str()?.to_owned();
+                match value["error"]["message"].as_str() {
+                    Some(message) => Some(format!("{code}: {message}")),
+                    None => Some(code),
+                }
+            })
+            .unwrap_or(raw);
+        bail!("{message}");
     }
     String::from_utf8(output.stdout).context("herdr returned non-UTF-8 output")
 }

@@ -1,7 +1,9 @@
 mod bd;
+mod claude;
 mod dashboard;
 mod herdr;
 mod model;
+mod queue;
 mod theme;
 
 use std::{env, path::PathBuf};

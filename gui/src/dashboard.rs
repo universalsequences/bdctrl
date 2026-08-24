@@ -1,17 +1,23 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use gpui::{
-    App, Bounds, ClickEvent, Context, Corner, Div, FocusHandle, Focusable, Hsla, IntoElement,
-    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Render, ScrollAnchor, ScrollHandle, SharedString, Styled, Window,
-    WindowBounds, WindowOptions, actions, anchored, deferred, div, point, prelude::*, px, relative,
-    size,
+    App, Bounds, ClickEvent, Context, Corner, Div, FocusHandle, Focusable, Hsla,
+    IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Render, ScrollAnchor, ScrollHandle, SharedString, Styled,
+    Window, WindowBounds, WindowOptions, actions, anchored, deferred, div, point, prelude::*, px,
+    relative, size,
 };
 
 use crate::{
     bd::BdClient,
+    claude,
     herdr::{self, AgentInfo, AgentKind},
-    model::{DashboardData, EpicSummary, Issue, WorkState},
+    model::{BlocksNode, DashboardData, EpicSummary, Issue, WorkState},
+    queue::{self, QueueEntry},
     theme,
 };
 
@@ -28,6 +34,7 @@ pub struct Dashboard {
     search_open: bool,
     search_query: String,
     agent_menu_for: Option<String>,
+    row_menu_for: Option<String>,
     launching_agent: Option<String>,
     agent_notice: Option<(String, bool, String)>,
     inspector_height: Option<Pixels>,
@@ -36,14 +43,55 @@ pub struct Dashboard {
     hovered_working: Option<String>,
     agent_previews: HashMap<String, Vec<String>>,
     working_menu_for: Option<String>,
+    queue: Vec<QueueEntry>,
+    queue_auto: bool,
+    queue_paused: Option<String>,
+    queue_launching: Option<String>,
+    // Beads we launched an agent for that has not yet run `bd update --claim`.
+    // Counted as working so the queue never double-launches into the gap
+    // between agent start and the claim landing in bd.
+    optimistic_claims: HashSet<String>,
 }
 
 #[derive(Clone)]
 struct WorkingItem {
     issue: Issue,
-    epic_title: Option<String>,
     anchor: Option<ScrollAnchor>,
     agent: Option<AgentInfo>,
+}
+
+#[derive(Clone)]
+struct DraggedQueueEntry {
+    id: String,
+    label: String,
+}
+
+struct QueueChipPreview {
+    entry: DraggedQueueEntry,
+}
+
+impl Render for QueueChipPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::accent())
+            .shadow_lg()
+            .text_xs()
+            .text_color(theme::text())
+            .font_family("Inter")
+            .child(format!("{} · {}", self.entry.id, self.entry.label))
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl Dashboard {
@@ -55,72 +103,70 @@ impl Dashboard {
         let bd = BdClient::new(project);
         Self::start_auto_refresh(cx);
         Self::start_preview_refresh(cx);
-        match bd.load() {
-            Ok(data) => Self {
-                bd,
-                data,
-                selected: None,
-                message: None,
-                dashboard_scroll: ScrollHandle::new(),
-                completed_toast: Vec::new(),
-                focus_handle: cx.focus_handle(),
-                search_open: false,
-                search_query: String::new(),
-                agent_menu_for: None,
-                launching_agent: None,
-                agent_notice: None,
-                inspector_height: None,
-                inspector_resize: None,
-                agents: HashMap::new(),
-                hovered_working: None,
-                agent_previews: HashMap::new(),
-                working_menu_for: None,
-            },
-            Err(error) => Self {
-                bd,
-                data: DashboardData::default(),
-                selected: None,
-                message: Some(error.to_string()),
-                dashboard_scroll: ScrollHandle::new(),
-                completed_toast: Vec::new(),
-                focus_handle: cx.focus_handle(),
-                search_open: false,
-                search_query: String::new(),
-                agent_menu_for: None,
-                launching_agent: None,
-                agent_notice: None,
-                inspector_height: None,
-                inspector_resize: None,
-                agents: HashMap::new(),
-                hovered_working: None,
-                agent_previews: HashMap::new(),
-                working_menu_for: None,
-            },
+        let queue = queue::load_queue(bd.project());
+        let queue_auto = queue::load_auto(bd.project());
+        let (data, message) = match bd.load() {
+            Ok(data) => (data, None),
+            Err(error) => (DashboardData::default(), Some(error.to_string())),
+        };
+        Self {
+            bd,
+            data,
+            selected: None,
+            message,
+            dashboard_scroll: ScrollHandle::new(),
+            completed_toast: Vec::new(),
+            focus_handle: cx.focus_handle(),
+            search_open: false,
+            search_query: String::new(),
+            agent_menu_for: None,
+            row_menu_for: None,
+            launching_agent: None,
+            agent_notice: None,
+            inspector_height: None,
+            inspector_resize: None,
+            agents: HashMap::new(),
+            hovered_working: None,
+            agent_previews: HashMap::new(),
+            working_menu_for: None,
+            queue,
+            queue_auto,
+            queue_paused: None,
+            queue_launching: None,
+            optimistic_claims: HashSet::new(),
         }
     }
 
     fn start_auto_refresh(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
+            // Which transcript belongs to which bead never changes, so the
+            // index lives across ticks and round-trips through each spawn.
+            let mut sessions = claude::SessionIndex::default();
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
                 let Some(client) = this.update(cx, |dashboard, _| dashboard.bd.clone()).ok() else {
                     break;
                 };
+                let index = std::mem::take(&mut sessions);
                 let result = cx
                     .background_executor()
                     .spawn(async move {
+                        let mut index = index;
                         let result = client.load();
-                        let agents = result
+                        let mut agents = result
                             .as_ref()
                             .map(|data| herdr::discover_agents(&data.issues, client.project()))
                             .unwrap_or_default();
-                        (result, agents)
+                        claude::attach_context(&mut agents, client.project(), &mut index);
+                        (result, agents, index)
                     })
                     .await;
+                sessions = result.2;
                 if this
                     .update(cx, |dashboard, cx| {
                         dashboard.agents = result.1;
                         dashboard.apply_load(result.0, true, cx);
+                        dashboard.queue_tick(cx);
                     })
                     .is_err()
                 {
@@ -167,6 +213,10 @@ impl Dashboard {
         .detach();
     }
 
+    fn is_working(&self, id: &str) -> bool {
+        self.data.state(id) == WorkState::InProgress || self.optimistic_claims.contains(id)
+    }
+
     fn apply_load(
         &mut self,
         result: anyhow::Result<DashboardData>,
@@ -175,6 +225,11 @@ impl Dashboard {
     ) {
         match result {
             Ok(data) => {
+                // A claim confirmed by bd (or a closed bead) is no longer ours
+                // to hold optimistically.
+                self.optimistic_claims.retain(|id| {
+                    data.issue(id).is_none_or(|bead| bead.status == "open")
+                });
                 if show_completions {
                     for issue in &data.issues {
                         let just_closed = issue.status == "closed"
@@ -369,6 +424,136 @@ impl Dashboard {
         .detach();
     }
 
+    // The TUI writes the same queue file, so every tick re-reads it before
+    // deciding anything.
+    fn queue_tick(&mut self, cx: &mut Context<Self>) {
+        self.queue = queue::load_queue(self.bd.project());
+        if queue::prune(&mut self.queue, &self.data) {
+            let _ = queue::save_queue(self.bd.project(), &self.queue);
+        }
+        if self.queue_auto && self.queue_paused.is_none() {
+            self.launch_next_queued(cx);
+        }
+        cx.notify();
+    }
+
+    // An agent whose bead is no longer in progress does not count: agents
+    // outlive their bead (the tab stays open after the bead closes).
+    fn deck_busy(&self) -> bool {
+        self.launching_agent.is_some()
+            || self.queue_launching.is_some()
+            || !self.optimistic_claims.is_empty()
+            || self
+                .agents
+                .keys()
+                .any(|id| self.data.state(id) == WorkState::InProgress)
+    }
+
+    fn launch_next_queued(&mut self, cx: &mut Context<Self>) {
+        if self.deck_busy() {
+            return;
+        }
+        let Some(entry) = queue::next_ready(&self.queue, &self.data).cloned() else {
+            return;
+        };
+        let Some(issue) = self.data.issue(&entry.id).cloned() else {
+            return;
+        };
+        self.queue.retain(|item| item.id != entry.id);
+        let _ = queue::save_queue(self.bd.project(), &self.queue);
+        self.queue_launching = Some(entry.id.clone());
+        self.optimistic_claims.insert(entry.id.clone());
+        let label = entry.kind.label(entry.model.as_deref());
+        self.agent_notice = Some((entry.id.clone(), false, format!("Queue: starting {label}…")));
+        cx.notify();
+
+        let cwd = self.bd.project().to_path_buf();
+        let task_entry = entry.clone();
+        let task = cx.background_executor().spawn(async move {
+            herdr::launch_agent(&issue, entry.kind, entry.model.as_deref(), &cwd)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |dashboard, cx| {
+                dashboard.queue_launching = None;
+                match result {
+                    Ok(name) => {
+                        dashboard.agent_notice =
+                            Some((task_entry.id.clone(), false, format!("Queue: started {name}")));
+                    }
+                    Err(error) => {
+                        // Back at the front and pause: the queue retries once
+                        // the user resumes, and never silently drops work.
+                        dashboard.optimistic_claims.remove(&task_entry.id);
+                        dashboard.queue.insert(0, task_entry.clone());
+                        let _ = queue::save_queue(dashboard.bd.project(), &dashboard.queue);
+                        dashboard.queue_paused = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_queue(
+        &mut self,
+        id: String,
+        kind: AgentKind,
+        model: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_menu_for = None;
+        self.row_menu_for = None;
+        if let Some(index) = queue::position(&self.queue, &id) {
+            self.queue.remove(index);
+        } else {
+            let cwd = queue::canonical_project(self.bd.project())
+                .to_string_lossy()
+                .into_owned();
+            self.queue.push(QueueEntry {
+                cwd,
+                id,
+                kind,
+                model,
+                at: now_millis(),
+            });
+        }
+        let _ = queue::save_queue(self.bd.project(), &self.queue);
+        cx.notify();
+    }
+
+    fn unqueue(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.queue.retain(|entry| entry.id != id);
+        let _ = queue::save_queue(self.bd.project(), &self.queue);
+        cx.notify();
+    }
+
+    fn move_queued(&mut self, dragged: &str, before: Option<&str>, cx: &mut Context<Self>) {
+        let Some(from) = queue::position(&self.queue, dragged) else {
+            return;
+        };
+        let entry = self.queue.remove(from);
+        let to = before
+            .and_then(|id| queue::position(&self.queue, id))
+            .unwrap_or(self.queue.len());
+        self.queue.insert(to, entry);
+        let _ = queue::save_queue(self.bd.project(), &self.queue);
+        cx.notify();
+    }
+
+    fn toggle_queue_auto(&mut self, cx: &mut Context<Self>) {
+        self.queue_auto = !self.queue_auto;
+        let _ = queue::save_auto(self.bd.project(), self.queue_auto);
+        cx.notify();
+    }
+
+    fn resume_queue(&mut self, cx: &mut Context<Self>) {
+        self.queue_paused = None;
+        cx.notify();
+    }
+
     fn toggle_agent_menu(
         &mut self,
         id: String,
@@ -387,6 +572,7 @@ impl Dashboard {
 
     fn close_agent_menu(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.agent_menu_for = None;
+        self.row_menu_for = None;
         cx.notify();
     }
 
@@ -406,7 +592,9 @@ impl Dashboard {
         let cwd = self.bd.project().to_path_buf();
         let label = kind.label(model.as_deref());
         self.agent_menu_for = None;
+        self.row_menu_for = None;
         self.launching_agent = Some(id.clone());
+        self.optimistic_claims.insert(id.clone());
         self.agent_notice = Some((id.clone(), false, format!("Starting {label}…")));
         cx.notify();
 
@@ -419,7 +607,10 @@ impl Dashboard {
                 dashboard.launching_agent = None;
                 dashboard.agent_notice = Some(match result {
                     Ok(name) => (id.clone(), false, format!("Started {label} as {name}")),
-                    Err(error) => (id.clone(), true, error.to_string()),
+                    Err(error) => {
+                        dashboard.optimistic_claims.remove(&id);
+                        (id.clone(), true, error.to_string())
+                    }
                 });
                 cx.notify();
             })
@@ -471,6 +662,9 @@ impl Dashboard {
     fn issue_row(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let state = self.data.state(&issue.id);
         let id = issue.id.clone();
+        let can_menu = issue.issue_type != "epic" && issue.status != "closed";
+        let row_menu_open = can_menu && self.row_menu_for.as_deref() == Some(issue.id.as_str());
+        let menu_id = issue.id.clone();
         let state_color = match state {
             WorkState::Ready => theme::ready(),
             WorkState::Blocked => theme::blocked(),
@@ -487,8 +681,23 @@ impl Dashboard {
             .py_1()
             .rounded_md()
             .cursor_pointer()
+            // Blocked beads fade back so the ready ones carry the card.
+            .when(state == WorkState::Blocked, |row| row.opacity(0.5))
             .hover(|style| style.bg(theme::surface_hover()))
             .on_click(cx.listener(move |this, _, _, cx| this.select(id.clone(), cx)))
+            .when(can_menu, |row| {
+                row.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.row_menu_for = Some(menu_id.clone());
+                        cx.notify();
+                    }),
+                )
+            })
+            .when(row_menu_open, |row| {
+                row.child(self.agent_menu(issue, Corner::TopLeft, cx))
+            })
             .child(
                 div()
                     .w(px(3.))
@@ -515,6 +724,9 @@ impl Dashboard {
                     .truncate()
                     .child(issue.title.clone()),
             )
+            .when_some(queue::position(&self.queue, &issue.id), |row, index| {
+                row.child(self.queued_badge(index))
+            })
             .child(self.state_badge(state))
     }
 
@@ -671,11 +883,12 @@ impl Dashboard {
             .unwrap_or_default();
         deferred(
             anchored()
-                .anchor(Corner::TopLeft)
-                .offset(point(px(0.), px(34.)))
+                .anchor(Corner::BottomLeft)
+                .offset(point(px(0.), px(-10.)))
                 .snap_to_window_with_margin(px(8.))
                 .child(
                     div()
+                        .occlude()
                         .w(px(500.))
                         .max_h(px(230.))
                         .rounded_lg()
@@ -700,6 +913,14 @@ impl Dashboard {
                                         .child(format!("{} · {}", agent.kind, item.issue.id)),
                                 )
                                 .child(div().flex_1())
+                                .when_some(agent.context_tokens, |header, tokens| {
+                                    header.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme::muted())
+                                            .child(format!("{} ctx", format_tokens(tokens))),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .size(px(6.))
@@ -750,11 +971,12 @@ impl Dashboard {
         let refresh_id = issue_id.to_owned();
         deferred(
             anchored()
-                .anchor(Corner::TopRight)
-                .offset(point(px(0.), px(26.)))
+                .anchor(Corner::BottomRight)
+                .offset(point(px(0.), px(-10.)))
                 .snap_to_window_with_margin(px(8.))
                 .child(
                     div()
+                        .occlude()
                         .w(px(190.))
                         .rounded_lg()
                         .bg(theme::background())
@@ -812,132 +1034,399 @@ impl Dashboard {
         .with_priority(3)
     }
 
-    fn working_strip(
+    fn deck_item(&self, item: WorkingItem, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let id = item.issue.id.clone();
+        let click_id = id.clone();
+        let hover_id = id.clone();
+        let menu_id = id.clone();
+        let anchor = item.anchor.clone();
+        let agent = item.agent.clone();
+        let is_hovered = self.hovered_working.as_deref() == Some(id.as_str());
+        let menu_open = self.working_menu_for.as_deref() == Some(id.as_str());
+        let status_color = agent
+            .as_ref()
+            .map(|agent| agent_status_color(&agent.status))
+            .unwrap_or_else(theme::muted);
+        div()
+            .id(SharedString::from(format!("working:{id}")))
+            .w_full()
+            .px_2()
+            .py_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_md()
+            .bg(theme::progress().opacity(0.08))
+            .border_1()
+            .border_color(theme::progress().opacity(0.2))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::progress().opacity(0.16)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(anchor) = &anchor {
+                    anchor.scroll_to(window, cx);
+                } else {
+                    this.select(click_id.clone(), cx);
+                }
+            }))
+            .child(div().size(px(6.)).rounded_full().bg(status_color))
+            .child(
+                div()
+                    .id(SharedString::from(format!("working-preview-trigger:{id}")))
+                    .px_1()
+                    .rounded_sm()
+                    .bg(theme::progress().opacity(0.14))
+                    .text_xs()
+                    .text_color(theme::progress())
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.hover_working(hover_id.clone(), *hovered, cx)
+                    }))
+                    .child(item.issue.id.clone())
+                    .when(is_hovered && agent.is_some() && !menu_open, |badge| {
+                        badge.child(self.working_preview(&item, agent.as_ref().unwrap()))
+                    }),
+            )
+            .when_some(
+                agent.as_ref().and_then(|agent| agent.context_tokens),
+                |row, tokens| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_size(px(9.))
+                            .text_color(theme::muted())
+                            .child(format!("{} ctx", format_tokens(tokens))),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme::text())
+                    .child(item.issue.title.clone()),
+            )
+            .when_some(agent.clone(), |chip, agent| {
+                chip.child(
+                    div()
+                        .id(SharedString::from(format!("working-menu:{id}")))
+                        .px_1()
+                        .rounded_sm()
+                        .text_sm()
+                        .text_color(theme::muted())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::raised_hover()))
+                        .on_click(cx.listener(move |this, event, window, cx| {
+                            this.toggle_working_menu(menu_id.clone(), event, window, cx)
+                        }))
+                        .child("•••")
+                        .when(menu_open, |button| {
+                            button.child(self.working_actions(&item.issue.id, &agent, cx))
+                        }),
+                )
+            })
+    }
+
+    fn queue_row(
+        &self,
+        index: usize,
+        entry: &QueueEntry,
+        next_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let id = entry.id.clone();
+        let ready = self.data.state(&id) == WorkState::Ready;
+        let is_next = next_id == Some(id.as_str());
+        let harness = entry.kind.label(entry.model.as_deref());
+        let title = self
+            .data
+            .issue(&id)
+            .map(|issue| issue.title.clone())
+            .unwrap_or_else(|| "(unknown bead)".into());
+        let drag = DraggedQueueEntry {
+            id: id.clone(),
+            label: title.clone(),
+        };
+        let drop_id = id.clone();
+        let click_id = id.clone();
+        let remove_id = id.clone();
+        div()
+            .id(SharedString::from(format!("queued:{id}")))
+            .px_2()
+            .py_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::raised_hover()))
+            .on_drag(drag, |dragged, _, _, cx| {
+                cx.new(|_| QueueChipPreview {
+                    entry: dragged.clone(),
+                })
+            })
+            .drag_over::<DraggedQueueEntry>(|style, _, _, _| {
+                style.bg(theme::accent().opacity(0.12))
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedQueueEntry, _, cx| {
+                this.move_queued(&dragged.id, Some(&drop_id), cx);
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.select(click_id.clone(), cx)))
+            .child(
+                div()
+                    .w(px(16.))
+                    .flex_none()
+                    .text_xs()
+                    .text_color(if is_next { theme::ready() } else { theme::muted() })
+                    .child(format!("{}", index + 1)),
+            )
+            .child(
+                div()
+                    .w(px(110.))
+                    .flex_none()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(id.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .text_color(if ready { theme::text() } else { theme::muted() })
+                    .child(title),
+            )
+            .when(!ready, |row| {
+                row.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::blocked())
+                        .child("blocked"),
+                )
+            })
+            .child(div().text_xs().text_color(theme::muted()).child(harness))
+            .child(
+                div()
+                    .id(SharedString::from(format!("unqueue:{id}")))
+                    .px_1()
+                    .rounded_sm()
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::raised_hover()).text_color(theme::text()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.unqueue(&remove_id, cx);
+                    }))
+                    .child("×"),
+            )
+    }
+
+    // The deck: a status row (what's running now, or a Run-next button when
+    // idle) with the auto/manual toggle on the right, and the queue as a
+    // vertical list underneath.
+    fn deck_console(
         &self,
         items: Vec<WorkingItem>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let next_id = queue::next_ready(&self.queue, &self.data).map(|entry| entry.id.clone());
+        let next_title = next_id
+            .as_deref()
+            .and_then(|id| self.data.issue(id))
+            .map(|issue| issue.title.clone());
+        let idle = items.is_empty() && !self.deck_busy();
+        let can_run_next = idle && next_id.is_some() && self.queue_paused.is_none();
+        let has_work = !items.is_empty();
         div()
-            .h(px(42.))
-            .min_h(px(42.))
-            .px_4()
             .flex()
-            .items_center()
+            .flex_col()
+            .px_4()
+            .py_2()
             .gap_2()
-            .border_b_1()
+            .border_t_1()
             .border_color(theme::border())
+            .bg(theme::raised())
             .child(
                 div()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme::progress())
-                    .child("WORKING"),
-            )
-            .child(div().w(px(1.)).h(px(16.)).bg(theme::border()))
-            .child(
-                div()
-                    .id("working-scroll")
-                    .min_w_0()
-                    .flex_1()
                     .flex()
+                    .items_center()
                     .gap_2()
-                    .overflow_x_scroll()
-                    .children(items.into_iter().map(|item| {
-                        let id = item.issue.id.clone();
-                        let click_id = id.clone();
-                        let hover_id = id.clone();
-                        let menu_id = id.clone();
-                        let anchor = item.anchor.clone();
-                        let agent = item.agent.clone();
-                        let is_hovered = self.hovered_working.as_deref() == Some(id.as_str());
-                        let menu_open = self.working_menu_for.as_deref() == Some(id.as_str());
-                        let subtitle = item
-                            .epic_title
-                            .as_deref()
-                            .map(|epic| format!(" · {epic}"))
-                            .unwrap_or_else(|| " · ungrouped".into());
+                    .min_h(px(28.))
+                    .when(has_work, |row| {
+                        row.items_start().child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(9.))
+                                        .text_color(theme::muted())
+                                        .child("NOW WORKING"),
+                                )
+                                .child(
+                                    div()
+                                        .id("deck-playing")
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .max_h(px(120.))
+                                        .overflow_y_scroll()
+                                        .children(
+                                            items.into_iter().map(|item| self.deck_item(item, cx)),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(!has_work, |row| {
+                        row.child({
+                            let left = div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_2();
+                            if let Some(error) = self.queue_paused.clone() {
+                                left.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(theme::danger())
+                                        .child(format!("queue paused · {error}")),
+                                )
+                                .child(
+                                    div()
+                                        .id("queue-resume")
+                                        .flex_none()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(theme::border())
+                                        .text_xs()
+                                        .text_color(theme::text())
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(theme::raised_hover()))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.resume_queue(cx)),
+                                        )
+                                        .child("resume"),
+                                )
+                            } else if can_run_next {
+                                left.child(
+                                    div()
+                                        .id("queue-run-next")
+                                        .flex_none()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(theme::accent().opacity(0.9))
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme::background())
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(theme::accent()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.launch_next_queued(cx)
+                                        }))
+                                        .child("Run next"),
+                                )
+                                .when_some(next_title, |row, title| {
+                                    row.child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(theme::muted())
+                                            .child(title),
+                                    )
+                                })
+                            } else {
+                                left.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child("nothing running"),
+                                )
+                            }
+                        })
+                    })
+                    .child(
                         div()
-                            .id(SharedString::from(format!("working:{id}")))
-                            .max_w(px(360.))
-                            .min_w_0()
+                            .id("queue-mode")
+                            .flex_none()
                             .px_2()
                             .py_1()
-                            .flex()
-                            .items_center()
-                            .gap_2()
                             .rounded_md()
-                            .bg(theme::progress().opacity(0.08))
                             .border_1()
-                            .border_color(theme::progress().opacity(0.2))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme::progress().opacity(0.16)))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(anchor) = &anchor {
-                                    anchor.scroll_to(window, cx);
-                                } else {
-                                    this.select(click_id.clone(), cx);
-                                }
-                            }))
-                            .child(div().size(px(6.)).rounded_full().bg(theme::progress()))
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("working-preview-trigger:{id}")))
-                                    .px_1()
-                                    .rounded_sm()
-                                    .bg(theme::progress().opacity(0.14))
-                                    .border_1()
-                                    .border_color(theme::progress().opacity(0.3))
-                                    .text_xs()
-                                    .text_color(theme::progress())
-                                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                        this.hover_working(hover_id.clone(), *hovered, cx)
-                                    }))
-                                    .child(item.issue.id.clone())
-                                    .when(is_hovered && agent.is_some() && !menu_open, |badge| {
-                                        badge.child(
-                                            self.working_preview(&item, agent.as_ref().unwrap()),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(theme::text())
-                                    .child(format!("{}{}", item.issue.title, subtitle)),
-                            )
-                            .when_some(agent.clone(), |working, agent| {
-                                working.child(
-                                    div()
-                                        .id(SharedString::from(format!("working-menu:{id}")))
-                                        .px_1()
-                                        .rounded_sm()
-                                        .text_sm()
-                                        .text_color(theme::muted())
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(theme::surface_hover()))
-                                        .on_click(cx.listener(move |this, event, window, cx| {
-                                            this.toggle_working_menu(
-                                                menu_id.clone(),
-                                                event,
-                                                window,
-                                                cx,
-                                            )
-                                        }))
-                                        .child("•••")
-                                        .when(menu_open, |button| {
-                                            button.child(self.working_actions(
-                                                &item.issue.id,
-                                                &agent,
-                                                cx,
-                                            ))
-                                        }),
-                                )
+                            .border_color(if self.queue_auto {
+                                theme::ready().opacity(0.4)
+                            } else {
+                                theme::border()
                             })
-                    })),
+                            .text_xs()
+                            .text_color(if self.queue_auto {
+                                theme::ready()
+                            } else {
+                                theme::muted()
+                            })
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::raised_hover()))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_queue_auto(cx)))
+                            .child(if self.queue_auto { "auto" } else { "manual" }),
+                    ),
             )
+            .when(!self.queue.is_empty(), |console| {
+                console.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(9.))
+                                .text_color(theme::muted())
+                                .child("QUEUE"),
+                        )
+                        .child(
+                            div()
+                                .id("deck-queue")
+                                .flex()
+                                .flex_col()
+                                .max_h(px(180.))
+                                .overflow_y_scroll()
+                                .children(self.queue.iter().enumerate().map(
+                                    |(index, entry)| {
+                                        self.queue_row(index, entry, next_id.as_deref(), cx)
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .id("queue-append")
+                                        .h(px(10.))
+                                        .rounded_md()
+                                        .drag_over::<DraggedQueueEntry>(|style, _, _, _| {
+                                            style.bg(theme::accent().opacity(0.12))
+                                        })
+                                        .on_drop(cx.listener(
+                                            |this, dragged: &DraggedQueueEntry, _, cx| {
+                                                this.move_queued(&dragged.id, None, cx);
+                                            },
+                                        )),
+                                ),
+                        ),
+                )
+            })
     }
 
     fn completion_toast(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -945,7 +1434,7 @@ impl Dashboard {
         div()
             .absolute()
             .right_4()
-            .bottom_4()
+            .bottom(px(104.))
             .w(px(340.))
             .max_h(px(260.))
             .flex()
@@ -1052,14 +1541,55 @@ impl Dashboard {
             )
     }
 
-    fn agent_menu(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn queue_option(
+        &self,
+        issue_id: &str,
+        kind: AgentKind,
+        model: Option<&str>,
+        title: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let id = issue_id.to_owned();
+        let model = model.map(str::to_owned);
+        div()
+            .id(SharedString::from(format!("queue:{title}")))
+            .px_3()
+            .py_2()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_queue(id.clone(), kind, model.clone(), cx)
+            }))
+            .child(div().text_sm().text_color(theme::text()).child(title))
+    }
+
+    fn queued_badge(&self, index: usize) -> Div {
+        div()
+            .px_1()
+            .rounded_sm()
+            .bg(theme::accent().opacity(0.12))
+            .border_1()
+            .border_color(theme::accent().opacity(0.3))
+            .text_size(px(9.))
+            .text_color(theme::accent())
+            .child(format!("♪ {}", index + 1))
+    }
+
+    fn agent_menu(
+        &self,
+        issue: &Issue,
+        corner: Corner,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let queued_at = queue::position(&self.queue, &issue.id);
         deferred(
             anchored()
-                .anchor(Corner::TopRight)
-                .offset(point(px(0.), px(28.)))
+                .anchor(corner)
+                .offset(point(px(0.), px(26.)))
                 .snap_to_window_with_margin(px(8.))
                 .child(
                     div()
+                        .occlude()
                         .w(px(280.))
                         .rounded_lg()
                         .bg(theme::background())
@@ -1067,6 +1597,14 @@ impl Dashboard {
                         .border_color(theme::border())
                         .shadow_lg()
                         .on_mouse_down_out(cx.listener(Self::close_agent_menu))
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .text_size(px(9.))
+                                .text_color(theme::muted())
+                                .child("START NOW"),
+                        )
                         .child(self.agent_option(
                             &issue.id,
                             AgentKind::Claude,
@@ -1090,10 +1628,166 @@ impl Dashboard {
                             "Pi",
                             "Launch with the Pi coding harness",
                             cx,
-                        )),
+                        ))
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .border_t_1()
+                                .border_color(theme::border())
+                                .text_size(px(9.))
+                                .text_color(theme::muted())
+                                .child("ADD TO QUEUE · starts when nothing is working"),
+                        )
+                        .when_some(queued_at, |menu, index| {
+                            let id = issue.id.clone();
+                            menu.child(
+                                div()
+                                    .id("unqueue-menu")
+                                    .px_3()
+                                    .py_2()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::surface_hover()))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.agent_menu_for = None;
+                                        this.row_menu_for = None;
+                                        this.unqueue(&id, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme::text())
+                                            .child(format!("Unqueue (currently #{})", index + 1)),
+                                    ),
+                            )
+                        })
+                        .when(queued_at.is_none(), |menu| {
+                            menu.child(self.queue_option(
+                                &issue.id,
+                                AgentKind::Claude,
+                                Some("claude-fable-5"),
+                                "Claude · Fable",
+                                cx,
+                            ))
+                            .child(self.queue_option(
+                                &issue.id,
+                                AgentKind::Claude,
+                                Some("claude-opus-5"),
+                                "Claude · Opus 5",
+                                cx,
+                            ))
+                            .child(self.queue_option(&issue.id, AgentKind::Pi, None, "Pi", cx))
+                        }),
                 ),
         )
         .with_priority(1)
+    }
+
+    fn blocks_row(&self, node: &BlocksNode, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let issue = self.data.issue(&node.id).cloned();
+        let known = issue.is_some();
+        let (mark, mark_color) = match issue.as_ref().map(|issue| issue.status.as_str()) {
+            Some("closed") => ("✓", theme::muted()),
+            Some("in_progress") => ("◐", theme::progress()),
+            Some("open") => match self.data.state(&node.id) {
+                WorkState::Blocked => ("○", theme::blocked()),
+                _ => ("○", theme::ready()),
+            },
+            _ => ("·", theme::muted()),
+        };
+        let select_id = node.id.clone();
+        div()
+            .id(SharedString::from(format!("blocks:{}", node.id)))
+            .flex()
+            .items_center()
+            .gap_1()
+            .w_full()
+            .px_1()
+            .rounded_sm()
+            .when(known, |row| {
+                row.cursor_pointer()
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select(select_id.clone(), cx)
+                    }))
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .font_family("monospace")
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child(node.prefix.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(mark_color)
+                    .child(mark),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(if known { theme::accent() } else { theme::muted() })
+                    .child(node.id.clone()),
+            )
+            .when_some(issue, |row, issue| {
+                let closed = issue.status == "closed";
+                row.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.))
+                        .text_color(theme::priority(issue.priority))
+                        .child(format!("P{}", issue.priority)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(if closed { theme::muted() } else { theme::text() })
+                        .child(issue.title.clone()),
+                )
+            })
+            .when(node.cycle, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme::danger())
+                        .child("↺ cycle"),
+                )
+            })
+    }
+
+    // What this bead is holding up, as a tree: direct dependents at the root,
+    // their dependents nested below — mirroring the TUI's BLOCKS section.
+    fn blocks_section(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let nodes = self.data.blocks_tree(&issue.id);
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_xs().text_color(theme::muted()).child("BLOCKS"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .when(nodes.is_empty(), |list| {
+                        list.child(
+                            div()
+                                .px_1()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child("none"),
+                        )
+                    })
+                    .children(nodes.iter().map(|node| self.blocks_row(node, cx))),
+            )
     }
 
     fn inspector(
@@ -1210,6 +1904,10 @@ impl Dashboard {
                                     .gap_2()
                                     .child(self.priority_pill(issue, cx))
                                     .child(self.state_badge(self.data.state(&issue.id)))
+                                    .when_some(
+                                        queue::position(&self.queue, &issue.id),
+                                        |row, index| row.child(self.queued_badge(index)),
+                                    )
                                     .child(div().flex_1())
                                     .when(can_launch, |row| {
                                         let id = issue.id.clone();
@@ -1245,7 +1943,11 @@ impl Dashboard {
                                                     "Start work ▾"
                                                 })
                                                 .when(menu_open && !is_launching, |button| {
-                                                    button.child(self.agent_menu(issue, cx))
+                                                    button.child(self.agent_menu(
+                                                        issue,
+                                                        Corner::TopRight,
+                                                        cx,
+                                                    ))
                                                 }),
                                         )
                                     }),
@@ -1308,6 +2010,7 @@ impl Dashboard {
                             }),
                         ))
                     })
+                    .child(self.blocks_section(issue, cx))
                     .when(can_move, |panel| {
                         panel.child(
                             div()
@@ -1434,31 +2137,6 @@ impl Render for Dashboard {
             .unwrap_or(window.bounds().size.height * 0.52)
             .max(px(220.))
             .min(window.bounds().size.height * 0.85);
-        if bottom_inspector && selected.is_some() {
-            let dashboard = cx.entity();
-            window.on_mouse_event(move |event: &MouseMoveEvent, _, window, cx| {
-                if !event.dragging() {
-                    return;
-                }
-                let max_height = window.bounds().size.height * 0.85;
-                dashboard.update(cx, |dashboard, cx| {
-                    if let Some((start_y, start_height)) = dashboard.inspector_resize {
-                        dashboard.inspector_height = Some(
-                            (start_height + start_y - event.position.y)
-                                .max(px(220.))
-                                .min(max_height),
-                        );
-                        cx.notify();
-                    }
-                });
-            });
-            let dashboard = cx.entity();
-            window.on_mouse_event(move |_: &MouseUpEvent, _, _, cx| {
-                dashboard.update(cx, |dashboard, _| {
-                    dashboard.inspector_resize = None;
-                });
-            });
-        }
         let project = self
             .bd
             .project()
@@ -1475,10 +2153,9 @@ impl Render for Dashboard {
         let mut working = Vec::new();
         for (epic, anchor) in self.data.epics.iter().zip(&epic_anchors) {
             for issue in &epic.children {
-                if self.data.state(&issue.id) == WorkState::InProgress {
+                if self.is_working(&issue.id) {
                     working.push(WorkingItem {
                         issue: issue.clone(),
-                        epic_title: Some(epic.epic.title.clone()),
                         anchor: Some(anchor.clone()),
                         agent: self.agents.get(&issue.id).cloned(),
                     });
@@ -1486,10 +2163,9 @@ impl Render for Dashboard {
             }
         }
         for issue in &self.data.ungrouped {
-            if self.data.state(&issue.id) == WorkState::InProgress {
+            if self.is_working(&issue.id) {
                 working.push(WorkingItem {
                     issue: issue.clone(),
-                    epic_title: None,
                     anchor: None,
                     agent: self.agents.get(&issue.id).cloned(),
                 });
@@ -1531,6 +2207,31 @@ impl Render for Dashboard {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::focus_search))
             .on_key_down(cx.listener(Self::search_key_down))
+            // Inspector resize drag: handlers live on the root element (which
+            // spans the window) — Window::on_mouse_event may only be called
+            // during paint and panics when registered from render.
+            .when(bottom_inspector, |root| {
+                root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                    if !event.dragging() {
+                        return;
+                    }
+                    if let Some((start_y, start_height)) = this.inspector_resize {
+                        let max_height = window.bounds().size.height * 0.85;
+                        this.inspector_height = Some(
+                            (start_height + start_y - event.position.y)
+                                .max(px(220.))
+                                .min(max_height),
+                        );
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, _| {
+                        this.inspector_resize = None;
+                    }),
+                )
+            })
             .child(
                 div()
                     .min_w_0()
@@ -1645,9 +2346,6 @@ impl Render for Dashboard {
                                     .child("↻"),
                             ),
                     )
-                    .when(query.is_empty() && !working.is_empty(), |main| {
-                        main.child(self.working_strip(working, cx))
-                    })
                     .child(
                         div()
                             .id("dashboard-scroll")
@@ -1694,7 +2392,8 @@ impl Render for Dashboard {
                                 .text_color(theme::danger())
                                 .child(message),
                         )
-                    }),
+                    })
+                    .child(self.deck_console(working, cx)),
             )
             .when_some(selected, |root, issue| {
                 root.child(self.inspector(&issue, bottom_inspector, inspector_height, cx))
@@ -1702,6 +2401,18 @@ impl Render for Dashboard {
             .when(!self.completed_toast.is_empty(), |root| {
                 root.child(self.completion_toast(cx))
             })
+    }
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1e6)
+    } else if tokens >= 10_000 {
+        format!("{}k", tokens / 1_000)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1e3)
+    } else {
+        tokens.to_string()
     }
 }
 

@@ -9,6 +9,14 @@ pub fn surface() -> Hsla {
 pub fn surface_hover() -> Hsla {
     rgb(0x181e2a).into()
 }
+// The deck console sits on this so it reads as its own layer above the
+// epic grid rather than blending into the card surfaces.
+pub fn raised() -> Hsla {
+    rgb(0x1a2132).into()
+}
+pub fn raised_hover() -> Hsla {
+    rgb(0x242d40).into()
+}
 pub fn border() -> Hsla {
     rgb(0x252c3a).into()
 }
