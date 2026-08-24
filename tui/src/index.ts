@@ -10,11 +10,92 @@ import {
   type KeyEvent,
   type TextChunk,
 } from "@opentui/core"
+import { existsSync, readFileSync } from "node:fs"
 import { basename, resolve } from "node:path"
 import { age, loadBeads, loadInProgress, loadIssueGraph, matchesBead, type Bead, type View } from "./beads"
 import { DESIGNER_ID, discoverAgentBindings, focusAgent, spawnAgent, spawnDesigner, spawnReviewer, type AgentKind } from "./herdr"
 import { advanceWorkflow, ensureWorktree, loadWorkflows, resumeWorkflow, reviewBindingId, saveWorkflows, worktreeDefaults, worktreeExemptIds, type ReviewConfig, type Workflow, type WorktreeConfig } from "./workflow"
 import { blockingBeadIds, loadQueue, nextQueued, pruneQueue, saveQueue, type QueueEntry } from "./queue"
+
+type ThemeColors = Record<string, string>
+
+const fallbackOmarchyColors: ThemeColors = {
+  accent: "#38bdf8",
+  selection: "#bae6fd",
+  background: "#101419",
+  foreground: "#cbd5e1",
+  color1: "#fb7185",
+  color2: "#4ade80",
+  color3: "#fbbf24",
+  color4: "#38bdf8",
+  color5: "#c4b5fd",
+  color7: "#cbd5e1",
+  color8: "#334155",
+  color13: "#f472b6",
+  color15: "#f8fafc",
+}
+
+function parseOmarchyColors(path: string): ThemeColors {
+  if (!existsSync(path)) return {}
+  const colors: ThemeColors = {}
+  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Za-z0-9_-]+)\s*=\s*["']?(#[0-9a-fA-F]{6})["']?\s*(?:#.*)?$/)
+    if (match) colors[match[1]!] = match[2]!.toLowerCase()
+  }
+  return colors
+}
+
+function omarchyColors(): ThemeColors {
+  const home = process.env.HOME ?? ""
+  return {
+    ...fallbackOmarchyColors,
+    ...parseOmarchyColors(`${home}/.local/state/omarchy/current/theme/colors.toml`),
+  }
+}
+
+function rgb(hex: string): [number, number, number] {
+  const clean = hex.replace("#", "")
+  return [0, 2, 4].map((offset) => Number.parseInt(clean.slice(offset, offset + 2), 16)) as [number, number, number]
+}
+
+function hex([r, g, b]: [number, number, number]): string {
+  return `#${[r, g, b].map((value) => Math.round(value).toString(16).padStart(2, "0")).join("")}`
+}
+
+function mix(left: string, right: string, amount: number): string {
+  const a = rgb(left), b = rgb(right)
+  return hex([a[0] * (1 - amount) + b[0] * amount, a[1] * (1 - amount) + b[1] * amount, a[2] * (1 - amount) + b[2] * amount])
+}
+
+const omarchy = omarchyColors()
+const theme = {
+  background: omarchy.background,
+  panel: omarchy.background,
+  panelAlt: mix(omarchy.background, omarchy.foreground, 0.08),
+  border: mix(omarchy.background, omarchy.foreground, 0.25),
+  muted: mix(omarchy.background, omarchy.foreground, 0.48),
+  text: omarchy.foreground,
+  bright: omarchy.color15,
+  accent: omarchy.accent,
+  selection: omarchy.selection,
+  selectedBg: mix(omarchy.background, omarchy.accent, 0.38),
+  selectedText: omarchy.color15,
+  selectedDescription: mix(omarchy.selection, omarchy.color15, 0.25),
+  progress: omarchy.color3,
+  progressBg: mix(omarchy.background, omarchy.color3, 0.32),
+  progressText: omarchy.color15,
+  progressDescription: mix(omarchy.color3, omarchy.color15, 0.45),
+  epic: omarchy.color5,
+  priority: omarchy.color13 ?? omarchy.color5,
+  open: mix(omarchy.background, omarchy.foreground, 0.62),
+  closed: omarchy.color2,
+  danger: omarchy.color1,
+  footer: mix(omarchy.background, omarchy.foreground, 0.65),
+  modalBg: mix(omarchy.background, omarchy.color5, 0.12),
+  modalBorder: omarchy.color5,
+  modalDescription: mix(omarchy.background, omarchy.color5, 0.58),
+  modalSelectedBg: mix(omarchy.background, omarchy.color5, 0.42),
+}
 
 const cwd = resolve(process.argv[2] ?? process.cwd())
 const repoName = basename(cwd)
@@ -45,10 +126,10 @@ const optimisticClaims = new Map<string, { bead: Bead }>()
 const launchedAgents = new Map<string, string>()
 
 const app = new BoxRenderable(renderer, {
-  id: "app", width: "100%", height: "100%", flexDirection: "column", backgroundColor: "#101419",
+  id: "app", width: "100%", height: "100%", flexDirection: "column", backgroundColor: theme.background,
 })
 const header = new TextRenderable(renderer, {
-  id: "header", height: 2, fg: "#7dd3fc", paddingX: 1, content: "beadsctrl",
+  id: "header", height: 2, fg: theme.accent, paddingX: 1, content: "beadsctrl",
 })
 const body = new BoxRenderable(renderer, {
   id: "body", width: "100%", flexGrow: 1, flexDirection: "row", gap: 1, paddingX: 1, overflow: "hidden",
@@ -59,59 +140,59 @@ const leftColumn = new BoxRenderable(renderer, {
 })
 const listBox = new BoxRenderable(renderer, {
   id: "list-box", width: "100%", flexGrow: 1, flexBasis: 0, minHeight: 6, overflow: "hidden",
-  border: true, borderColor: "#334155", titleColor: "#7dd3fc",
+  border: true, borderColor: theme.border, titleColor: theme.accent,
 })
 const list = new SelectRenderable(renderer, {
   id: "beads", width: "100%", height: "100%", padding: 1,
   options: [], wrapSelection: true, showDescription: true, showScrollIndicator: true,
-  textColor: "#cbd5e1", descriptionColor: "#64748b",
-  selectedBackgroundColor: "#164e63", selectedTextColor: "#f0f9ff",
-  selectedDescriptionColor: "#bae6fd", focusedBackgroundColor: "#101419",
+  textColor: theme.text, descriptionColor: theme.muted,
+  selectedBackgroundColor: theme.selectedBg, selectedTextColor: theme.selectedText,
+  selectedDescriptionColor: theme.selectedDescription, focusedBackgroundColor: theme.background,
 })
 const progressBox = new BoxRenderable(renderer, {
   id: "progress-box", width: "100%", height: "35%", flexGrow: 0, flexShrink: 0, overflow: "hidden",
-  border: true, borderColor: "#334155", title: "In progress", titleColor: "#fbbf24",
+  border: true, borderColor: theme.border, title: "In progress", titleColor: theme.progress,
 })
 const progressList = new SelectRenderable(renderer, {
   id: "in-progress", width: "100%", height: "100%", padding: 1,
   options: [], showDescription: true, showScrollIndicator: true, showSelectionIndicator: false,
-  wrapSelection: true, textColor: "#e2e8f0", descriptionColor: "#a16207",
-  selectedBackgroundColor: "#101419", selectedTextColor: "#e2e8f0",
-  selectedDescriptionColor: "#a16207", focusedBackgroundColor: "#101419",
+  wrapSelection: true, textColor: theme.text, descriptionColor: theme.progress,
+  selectedBackgroundColor: theme.background, selectedTextColor: theme.text,
+  selectedDescriptionColor: theme.progress, focusedBackgroundColor: theme.background,
 })
 const workflowBox = new BoxRenderable(renderer, {
   id: "workflow-box", width: "100%", height: 0, flexGrow: 0, flexShrink: 0, overflow: "hidden",
-  border: true, borderColor: "#334155", title: "Epic workflows", titleColor: "#c4b5fd", visible: false,
+  border: true, borderColor: theme.border, title: "Epic workflows", titleColor: theme.epic, visible: false,
 })
 const workflowText = new TextRenderable(renderer, {
-  id: "workflows", width: "100%", height: "100%", padding: 1, fg: "#cbd5e1", content: "",
+  id: "workflows", width: "100%", height: "100%", padding: 1, fg: theme.text, content: "",
 })
 const modalBox = new BoxRenderable(renderer, {
   id: "workflow-modal", position: "absolute", left: "20%", top: 4, width: "60%", height: 12,
   zIndex: 100, visible: false, flexDirection: "column", overflow: "hidden",
-  border: true, borderColor: "#a78bfa", backgroundColor: "#171226",
-  title: "Epic workflow", titleColor: "#c4b5fd",
+  border: true, borderColor: theme.modalBorder, backgroundColor: theme.modalBg,
+  title: "Epic workflow", titleColor: theme.epic,
 })
 const modalHeader = new TextRenderable(renderer, {
-  id: "workflow-modal-header", width: "100%", height: 2, paddingX: 1, paddingTop: 1, fg: "#e9d5ff", content: "",
+  id: "workflow-modal-header", width: "100%", height: 2, paddingX: 1, paddingTop: 1, fg: theme.selectedDescription, content: "",
 })
 const modalSelect = new SelectRenderable(renderer, {
   id: "workflow-modal-select", width: "100%", flexGrow: 1, padding: 1,
   options: [], wrapSelection: true, showDescription: true, showScrollIndicator: false,
-  textColor: "#e2e8f0", descriptionColor: "#7c7195", backgroundColor: "#171226",
-  selectedBackgroundColor: "#4c1d95", selectedTextColor: "#faf5ff",
-  selectedDescriptionColor: "#d8b4fe", focusedBackgroundColor: "#171226",
+  textColor: theme.text, descriptionColor: theme.modalDescription, backgroundColor: theme.modalBg,
+  selectedBackgroundColor: theme.modalSelectedBg, selectedTextColor: theme.selectedText,
+  selectedDescriptionColor: theme.selectedDescription, focusedBackgroundColor: theme.modalBg,
 })
 const detailBox = new BoxRenderable(renderer, {
   id: "detail-box", flexBasis: 0, flexGrow: 1, flexShrink: 1, minWidth: 0, height: "100%", overflow: "hidden",
-  border: true, borderColor: "#334155", title: "Details", titleColor: "#7dd3fc",
+  border: true, borderColor: theme.border, title: "Details", titleColor: theme.accent,
 })
 const detail = new TextRenderable(renderer, {
   id: "detail", width: "100%", minWidth: 0, height: "100%", padding: 1,
-  fg: "#cbd5e1", wrapMode: "word", content: "",
+  fg: theme.text, wrapMode: "word", content: "",
 })
 const footer = new TextRenderable(renderer, {
-  id: "footer", height: 2, paddingX: 1, fg: "#94a3b8", content: "",
+  id: "footer", height: 2, paddingX: 1, fg: theme.footer, content: "",
 })
 
 listBox.add(list)
@@ -151,16 +232,16 @@ function focusList(target: "ready" | "progress"): void {
   // inactive selection visually identical to an ordinary row. This leaves a
   // single cursor/highlight across both lists.
   list.showSelectionIndicator = readyActive
-  list.selectedBackgroundColor = readyActive ? "#164e63" : "#101419"
-  list.selectedTextColor = readyActive ? "#f0f9ff" : "#cbd5e1"
-  list.selectedDescriptionColor = readyActive ? "#bae6fd" : "#64748b"
+  list.selectedBackgroundColor = readyActive ? theme.selectedBg : theme.background
+  list.selectedTextColor = readyActive ? theme.selectedText : theme.text
+  list.selectedDescriptionColor = readyActive ? theme.selectedDescription : theme.muted
   progressList.showSelectionIndicator = !readyActive
-  progressList.selectedBackgroundColor = readyActive ? "#101419" : "#713f12"
-  progressList.selectedTextColor = readyActive ? "#e2e8f0" : "#fffbeb"
-  progressList.selectedDescriptionColor = readyActive ? "#a16207" : "#fde68a"
+  progressList.selectedBackgroundColor = readyActive ? theme.background : theme.progressBg
+  progressList.selectedTextColor = readyActive ? theme.text : theme.progressText
+  progressList.selectedDescriptionColor = readyActive ? theme.progress : theme.progressDescription
 
-  listBox.borderColor = readyActive ? "#38bdf8" : "#334155"
-  progressBox.borderColor = readyActive ? "#334155" : "#f59e0b"
+  listBox.borderColor = readyActive ? theme.accent : theme.border
+  progressBox.borderColor = readyActive ? theme.border : theme.progress
   if (readyActive) list.focus()
   else progressList.focus()
   updateDetail()
@@ -303,16 +384,16 @@ function renderLists(previous = {
 }
 
 const detailColors = {
-  text: "#cbd5e1",
-  bright: "#f8fafc",
-  muted: "#64748b",
-  accent: "#38bdf8",
-  epic: "#c4b5fd",
-  priority: "#f472b6",
-  open: "#94a3b8",
-  progress: "#fbbf24",
-  closed: "#4ade80",
-  danger: "#fb7185",
+  text: theme.text,
+  bright: theme.bright,
+  muted: theme.muted,
+  accent: theme.accent,
+  epic: theme.epic,
+  priority: theme.priority,
+  open: theme.open,
+  progress: theme.progress,
+  closed: theme.closed,
+  danger: theme.danger,
 } as const
 
 function colored(text: string, color: string, strong = false): TextChunk {
