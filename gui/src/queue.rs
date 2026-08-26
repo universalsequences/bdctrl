@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
 };
@@ -72,6 +73,69 @@ pub fn next_ready<'a>(queue: &'a [QueueEntry], data: &DashboardData) -> Option<&
 
 pub fn position(queue: &[QueueEntry], bead_id: &str) -> Option<usize> {
     queue.iter().position(|entry| entry.id == bead_id)
+}
+
+// Scans an agent may be missing from before its claim is written off. An
+// agent that vanishes without claiming — tab closed, harness died, permission
+// prompt declined — would otherwise hold the deck for the rest of the
+// session. Several ticks, so a scan that started before the tab existed, or a
+// herdr call that failed once, never releases the tree out from under a live
+// agent.
+pub const CLAIM_MISSES: u8 = 3;
+
+// A bead we launched an agent for that has not yet run `bd update --claim`.
+// It counts as working so the queue never double-launches into the gap
+// between agent start and the claim landing in bd.
+#[derive(Debug)]
+pub struct Claim {
+    // The queue entry this launch came from, so work is put back where it was
+    // if the launch never lands. Hand-started launches have nothing to
+    // restore.
+    pub entry: Option<QueueEntry>,
+    // False until the launch returns: an in-flight launch has no tab to look
+    // for yet.
+    pub launched: bool,
+    // Consecutive scans since the launch returned that did not see the agent.
+    pub misses: u8,
+}
+
+impl Claim {
+    pub fn new(entry: Option<QueueEntry>) -> Self {
+        Self { entry, launched: false, misses: 0 }
+    }
+}
+
+// Drops claims bd has confirmed (or that closed), and expires the ones whose
+// agent has been gone for CLAIM_MISSES scans running. Beads bd has never
+// heard of are kept: the issue graph may not be loaded yet. Returns the
+// expired claims — the caller decides what to do with the work they were
+// holding.
+pub fn expire_claims(
+    claims: &mut HashMap<String, Claim>,
+    data: &DashboardData,
+    present: impl Fn(&str) -> bool,
+) -> Vec<(String, Claim)> {
+    let mut confirmed = Vec::new();
+    let mut expired = Vec::new();
+    for (id, claim) in claims.iter_mut() {
+        if data.issue(id).is_some_and(|bead| bead.status != "open") {
+            confirmed.push(id.clone());
+        } else if !claim.launched || present(id) {
+            claim.misses = 0;
+        } else {
+            claim.misses += 1;
+            if claim.misses >= CLAIM_MISSES {
+                expired.push(id.clone());
+            }
+        }
+    }
+    for id in confirmed {
+        claims.remove(&id);
+    }
+    expired
+        .into_iter()
+        .filter_map(|id| claims.remove(&id).map(|claim| (id, claim)))
+        .collect()
 }
 
 // GUI-only preferences (the auto/manual toggle) live next to the shared queue
@@ -304,6 +368,81 @@ mod tests {
         assert!(prune(&mut queue, &data));
         let ids: Vec<_> = queue.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(ids, ["open", "mystery"]);
+    }
+
+    fn claims(ids: [(&str, bool); 1]) -> HashMap<String, Claim> {
+        ids.into_iter()
+            .map(|(id, launched)| {
+                let mut claim = Claim::new(Some(entry(id)));
+                claim.launched = launched;
+                (id.to_string(), claim)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claim_is_held_while_the_launch_is_still_in_flight() {
+        let data = DashboardData::new(vec![issue("bd-1", "open", None)]);
+        let mut held = claims([("bd-1", false)]);
+        for _ in 0..CLAIM_MISSES + 2 {
+            assert!(expire_claims(&mut held, &data, |_| false).is_empty());
+        }
+        assert!(held.contains_key("bd-1"));
+    }
+
+    #[test]
+    fn claim_is_held_while_its_agent_is_alive() {
+        let data = DashboardData::new(vec![issue("bd-1", "open", None)]);
+        let mut held = claims([("bd-1", true)]);
+        for _ in 0..CLAIM_MISSES + 2 {
+            assert!(expire_claims(&mut held, &data, |_| true).is_empty());
+        }
+        assert!(held.contains_key("bd-1"));
+    }
+
+    #[test]
+    fn claim_expires_once_its_agent_is_gone_for_good() {
+        let data = DashboardData::new(vec![issue("bd-1", "open", None)]);
+        let mut held = claims([("bd-1", true)]);
+        for _ in 1..CLAIM_MISSES {
+            assert!(expire_claims(&mut held, &data, |_| false).is_empty());
+        }
+        let expired = expire_claims(&mut held, &data, |_| false);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, "bd-1");
+        // The bead it was holding comes back so the caller can requeue it.
+        assert_eq!(expired[0].1.entry.as_ref().map(|entry| entry.id.as_str()), Some("bd-1"));
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn a_scan_that_sees_the_agent_again_resets_the_count() {
+        let data = DashboardData::new(vec![issue("bd-1", "open", None)]);
+        let mut held = claims([("bd-1", true)]);
+        for _ in 1..CLAIM_MISSES {
+            expire_claims(&mut held, &data, |_| false);
+        }
+        assert!(expire_claims(&mut held, &data, |_| true).is_empty());
+        for _ in 1..CLAIM_MISSES {
+            assert!(expire_claims(&mut held, &data, |_| false).is_empty());
+        }
+        assert!(held.contains_key("bd-1"));
+    }
+
+    #[test]
+    fn a_confirmed_claim_is_dropped_not_expired() {
+        let data = DashboardData::new(vec![issue("bd-1", "in_progress", None)]);
+        let mut held = claims([("bd-1", true)]);
+        assert!(expire_claims(&mut held, &data, |_| false).is_empty());
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn a_claim_on_a_bead_bd_has_not_reported_is_kept() {
+        let data = DashboardData::new(Vec::new());
+        let mut held = claims([("mystery", false)]);
+        assert!(expire_claims(&mut held, &data, |_| false).is_empty());
+        assert!(held.contains_key("mystery"));
     }
 
     #[test]

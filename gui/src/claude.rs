@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -25,6 +25,20 @@ pub struct SessionIndex {
     // Bead id from each transcript's first user message. Heads never change,
     // so each file is read at most once.
     heads: HashMap<PathBuf, Option<String>>,
+    // Bead each transcript currently holds a claim on, plus how far into the
+    // file that answer was read from.
+    claims: HashMap<PathBuf, ClaimScan>,
+}
+
+#[derive(Default)]
+struct ClaimScan {
+    scanned: u64,
+    bead: Option<String>,
+}
+
+enum Claim {
+    Take(String),
+    Drop(String),
 }
 
 impl SessionIndex {
@@ -43,6 +57,117 @@ impl SessionIndex {
         }
         bead
     }
+
+    // The bead a session is holding: the last `bd update <id> --claim` it ran,
+    // released again when that same bead is closed. Transcripts only ever grow,
+    // so each pass reads just the lines appended since the last one — the
+    // scan stays cheap enough to run on every refresh tick.
+    pub fn claimed_bead(&mut self, path: &Path, known: &HashSet<&str>) -> Option<String> {
+        let scan = self.claims.entry(path.to_owned()).or_default();
+        let Ok(length) = fs::metadata(path).map(|metadata| metadata.len()) else {
+            return scan.bead.clone();
+        };
+        // A rewritten (compacted) transcript is no longer the file we read.
+        if length < scan.scanned {
+            *scan = ClaimScan::default();
+        }
+        if length > scan.scanned
+            && let Some((text, consumed)) = read_from(path, scan.scanned)
+        {
+            for line in text.lines() {
+                for claim in claims_in_line(line, known) {
+                    match claim {
+                        Claim::Take(bead) => scan.bead = Some(bead),
+                        Claim::Drop(bead) if scan.bead.as_deref() == Some(&bead) => {
+                            scan.bead = None
+                        }
+                        Claim::Drop(_) => {}
+                    }
+                }
+            }
+            scan.scanned += consumed;
+        }
+        scan.bead.clone()
+    }
+}
+
+// Claims recorded by one transcript line, in the order the agent ran them.
+fn claims_in_line(line: &str, known: &HashSet<&str>) -> Vec<Claim> {
+    if !line.contains("--claim") && !line.contains("bd close") && !line.contains("in_progress") {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    // Subagents run in their own context; a claim there is still the parent
+    // session's work, but a sidechain never claims on its own behalf.
+    if value["isSidechain"].as_bool() == Some(true) {
+        return Vec::new();
+    }
+    value["message"]["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block["input"]["command"].as_str())
+                .flat_map(|command| claims_in_command(command, known))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// One shell command may chain several `bd` calls; each pipeline segment is
+// checked on its own so `bd show x && bd update x --claim` is not read as a
+// single invocation.
+fn claims_in_command(command: &str, known: &HashSet<&str>) -> Vec<Claim> {
+    let mut claims = Vec::new();
+    for segment in command.split(['\n', ';', '|', '&']) {
+        let mut tokens = segment.split_whitespace().skip_while(|token| *token != "bd");
+        if tokens.next().is_none() {
+            continue;
+        }
+        let Some(subcommand) = tokens.next() else {
+            continue;
+        };
+        let arguments: Vec<&str> = tokens.collect();
+        // The bead is whichever argument is an id we know; that beats
+        // positional guessing, which flag values like `--status in_progress`
+        // would otherwise break.
+        let Some(bead) = arguments
+            .iter()
+            .map(|token| unquote(token))
+            .find(|token| known.contains(token))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let claimed = arguments
+            .iter()
+            .any(|token| *token == "--claim" || unquote(token) == "in_progress");
+        match subcommand {
+            "update" if claimed => claims.push(Claim::Take(bead)),
+            "claim" => claims.push(Claim::Take(bead)),
+            "close" => claims.push(Claim::Drop(bead)),
+            _ => {}
+        }
+    }
+    claims
+}
+
+fn unquote(token: &str) -> &str {
+    token.trim_matches(|character| "\"'`".contains(character))
+}
+
+// Text appended since `offset`, truncated to whole lines, with the number of
+// bytes those lines cover so the next pass resumes on a line boundary.
+fn read_from(path: &Path, offset: u64) -> Option<(String, u64)> {
+    let mut file = fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).ok()?;
+    let end = buffer.iter().rposition(|byte| *byte == b'\n')? + 1;
+    buffer.truncate(end);
+    Some((String::from_utf8_lossy(&buffer).into_owned(), end as u64))
 }
 
 // Fill in context_tokens for every Claude agent that has a matching session
@@ -56,7 +181,7 @@ pub fn attach_context(
     if !agents.values().any(|agent| agent.kind.contains("claude")) {
         return;
     }
-    let Some(dir) = sessions_dir(project) else {
+    let Some(dir) = transcript_dir(project) else {
         return;
     };
     let Ok(entries) = fs::read_dir(dir) else {
@@ -83,12 +208,13 @@ pub fn attach_context(
             continue;
         };
         if agent.kind.contains("claude") && agent.context_tokens.is_none() {
-            agent.context_tokens = read_tail(path).and_then(|text| tokens_from_tail(&text));
+            agent.context_tokens = context_tokens(path);
         }
     }
 }
 
-fn sessions_dir(project: &Path) -> Option<PathBuf> {
+// Where Claude Code keeps the transcripts for sessions started in `project`.
+pub fn transcript_dir(project: &Path) -> Option<PathBuf> {
     let home = env::var_os("HOME")?;
     let slug: String = project
         .display()
@@ -139,6 +265,10 @@ fn bead_from_head(text: &str) -> (Option<String>, bool) {
         return (bead, true);
     }
     (None, false)
+}
+
+pub fn context_tokens(path: &Path) -> Option<u64> {
+    read_tail(path).and_then(|text| tokens_from_tail(&text))
 }
 
 // Context size after the latest main-chain assistant turn: everything on the
@@ -241,8 +371,71 @@ mod tests {
     }
 
     #[test]
+    fn reads_claims_and_releases_out_of_bd_commands() {
+        let known = HashSet::from(["bd-42", "bd-9", "bd-9.1"]);
+        let claims = |command| {
+            claims_in_command(command, &known)
+                .into_iter()
+                .map(|claim| match claim {
+                    Claim::Take(bead) => format!("take {bead}"),
+                    Claim::Drop(bead) => format!("drop {bead}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(claims("bd update bd-42 --claim 2>&1"), ["take bd-42"]);
+        assert_eq!(claims("bd update --status in_progress bd-9.1"), ["take bd-9.1"]);
+        assert_eq!(claims("bd close bd-42 --reason=\"done\""), ["drop bd-42"]);
+        // Each segment of a chain is its own invocation.
+        assert_eq!(
+            claims("cd /x && bd show bd-9; bd update bd-9 --claim && bd close bd-42"),
+            ["take bd-9", "drop bd-42"]
+        );
+        // Beads we do not know, and commands that are not claims, say nothing.
+        assert!(claims("bd update bd-77 --claim").is_empty());
+        assert!(claims("bd update bd-42 --notes=\"in_progress somewhere\"").is_empty());
+        assert!(claims("grep -rn 'bd update bd-42' src").is_empty());
+    }
+
+    #[test]
+    fn tracks_the_bead_a_transcript_currently_holds() {
+        let known = HashSet::from(["bd-42", "bd-9"]);
+        let mut index = SessionIndex::default();
+        let path = std::env::temp_dir().join("beadsctrl-claim-scan.jsonl");
+        let entry = |command: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","input":{{"command":"{command}"}}}}]}}}}"#
+            )
+        };
+
+        fs::write(&path, entry("bd update bd-42 --claim") + "\n").unwrap();
+        assert_eq!(index.claimed_bead(&path, &known).as_deref(), Some("bd-42"));
+
+        // Only the bytes appended since the last pass are read.
+        let mut appended = fs::read_to_string(&path).unwrap();
+        appended.push_str(&(entry("bd close bd-42 --reason=done") + "\n"));
+        appended.push_str(&(entry("bd update bd-9 --claim") + "\n"));
+        fs::write(&path, appended).unwrap();
+        assert_eq!(index.claimed_bead(&path, &known).as_deref(), Some("bd-9"));
+
+        // A partial trailing line is left for the next pass.
+        let held = fs::read_to_string(&path).unwrap() + &entry("bd close bd-9");
+        fs::write(&path, held).unwrap();
+        assert_eq!(index.claimed_bead(&path, &known).as_deref(), Some("bd-9"));
+        fs::write(&path, fs::read_to_string(&path).unwrap() + "\n").unwrap();
+        assert_eq!(index.claimed_bead(&path, &known), None);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_sidechain_claim_is_not_the_session_claim() {
+        let known = HashSet::from(["bd-42"]);
+        let line = r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"tool_use","input":{"command":"bd update bd-42 --claim"}}]}}"#;
+        assert!(claims_in_line(line, &known).is_empty());
+    }
+
+    #[test]
     fn sessions_dir_slugifies_the_project_path() {
-        let dir = sessions_dir(Path::new("/home/alec/code/bdctrl")).unwrap();
+        let dir = transcript_dir(Path::new("/home/alec/code/bdctrl")).unwrap();
         assert!(dir.ends_with(".claude/projects/-home-alec-code-bdctrl"));
     }
 }

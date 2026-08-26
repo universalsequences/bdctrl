@@ -22,6 +22,9 @@ With no path, the current directory is used.
 - Move a bead between epics from the inspector
 - Launch Pi or Claude agents through Herdr from the inspector
 - Hover working beads for a live agent-output preview; use `•••` to focus the agent
+- Agent tabs started by hand join the deck too: an untracked Herdr pane is
+  matched to the bead it claimed, from its Claude transcript or its terminal
+  output, and marked `external`
 - Automatic refresh after external changes, with completion notifications
 - `Ctrl+F` search across epic titles, bead titles, and bead IDs
 

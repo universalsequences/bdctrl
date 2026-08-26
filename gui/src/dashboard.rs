@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -7,14 +7,14 @@ use std::{
 use gpui::{
     App, Bounds, ClickEvent, Context, Corner, Div, FocusHandle, Focusable, Hsla,
     IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Render, ScrollAnchor, ScrollHandle, SharedString, Styled,
-    Window, WindowBounds, WindowOptions, actions, anchored, deferred, div, point, prelude::*, px,
-    relative, size,
+    MouseUpEvent, ParentElement, Pixels, Render, ScrollAnchor, ScrollHandle, SharedString,
+    Stateful, Styled, Window, WindowBounds, WindowOptions, actions, anchored, deferred, div,
+    point, prelude::*, px, relative, size,
 };
 
 use crate::{
+    agents::AgentScan,
     bd::BdClient,
-    claude,
     herdr::{self, AgentInfo, AgentKind},
     model::{BlocksNode, DashboardData, EpicSummary, Issue, WorkState},
     queue::{self, QueueEntry},
@@ -34,6 +34,7 @@ pub struct Dashboard {
     search_open: bool,
     search_query: String,
     agent_menu_for: Option<String>,
+    priority_menu_for: Option<String>,
     row_menu_for: Option<String>,
     launching_agent: Option<String>,
     agent_notice: Option<(String, bool, String)>,
@@ -47,10 +48,9 @@ pub struct Dashboard {
     queue_auto: bool,
     queue_paused: Option<String>,
     queue_launching: Option<String>,
-    // Beads we launched an agent for that has not yet run `bd update --claim`.
-    // Counted as working so the queue never double-launches into the gap
-    // between agent start and the claim landing in bd.
-    optimistic_claims: HashSet<String>,
+    // Beads we launched an agent for that has not yet run `bd update --claim`,
+    // keyed by bead id. See queue::Claim.
+    optimistic_claims: HashMap<String, queue::Claim>,
 }
 
 #[derive(Clone)]
@@ -120,6 +120,7 @@ impl Dashboard {
             search_open: false,
             search_query: String::new(),
             agent_menu_for: None,
+            priority_menu_for: None,
             row_menu_for: None,
             launching_agent: None,
             agent_notice: None,
@@ -133,35 +134,35 @@ impl Dashboard {
             queue_auto,
             queue_paused: None,
             queue_launching: None,
-            optimistic_claims: HashSet::new(),
+            optimistic_claims: HashMap::new(),
         }
     }
 
     fn start_auto_refresh(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            // Which transcript belongs to which bead never changes, so the
-            // index lives across ticks and round-trips through each spawn.
-            let mut sessions = claude::SessionIndex::default();
+            // What each transcript and pane was last seen doing never has to
+            // be worked out twice, so the scan lives across ticks and
+            // round-trips through each spawn.
+            let mut scan = AgentScan::default();
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
                 let Some(client) = this.update(cx, |dashboard, _| dashboard.bd.clone()).ok() else {
                     break;
                 };
-                let index = std::mem::take(&mut sessions);
+                let taken = std::mem::take(&mut scan);
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        let mut index = index;
+                        let mut scan = taken;
                         let result = client.load();
-                        let mut agents = result
+                        let agents = result
                             .as_ref()
-                            .map(|data| herdr::discover_agents(&data.issues, client.project()))
+                            .map(|data| scan.run(data, client.project()))
                             .unwrap_or_default();
-                        claude::attach_context(&mut agents, client.project(), &mut index);
-                        (result, agents, index)
+                        (result, agents, scan)
                     })
                     .await;
-                sessions = result.2;
+                scan = result.2;
                 if this
                     .update(cx, |dashboard, cx| {
                         dashboard.agents = result.1;
@@ -194,10 +195,10 @@ impl Dashboard {
                 else {
                     continue;
                 };
-                let name = agent.name.clone();
+                let target = agent.target.clone();
                 let result = cx
                     .background_executor()
-                    .spawn(async move { herdr::read_agent_preview(&name, &cwd) })
+                    .spawn(async move { herdr::read_agent_preview(&target, &cwd) })
                     .await;
                 if let Ok(lines) = result {
                     this.update(cx, |dashboard, cx| {
@@ -213,8 +214,14 @@ impl Dashboard {
         .detach();
     }
 
+    // Deck membership: a bead we just launched (optimistic claim, shows
+    // before the herdr tab even exists) or an in-progress bead with a live
+    // herdr agent — one of ours, or a tab somebody opened by hand that we
+    // attributed to the bead. In-progress beads with no agent — e.g. stale
+    // imports that were never closed — stay out of the deck.
     fn is_working(&self, id: &str) -> bool {
-        self.data.state(id) == WorkState::InProgress || self.optimistic_claims.contains(id)
+        self.optimistic_claims.contains_key(id)
+            || (self.data.state(id) == WorkState::InProgress && self.agents.contains_key(id))
     }
 
     fn apply_load(
@@ -225,11 +232,27 @@ impl Dashboard {
     ) {
         match result {
             Ok(data) => {
-                // A claim confirmed by bd (or a closed bead) is no longer ours
-                // to hold optimistically.
-                self.optimistic_claims.retain(|id| {
-                    data.issue(id).is_none_or(|bead| bead.status == "open")
+                let agents = &self.agents;
+                let expired = queue::expire_claims(&mut self.optimistic_claims, &data, |id| {
+                    agents.contains_key(id)
                 });
+                for (id, claim) in expired {
+                    // The agent we launched is gone and never claimed its
+                    // bead. Releasing the deck is what unwedges the queue, but
+                    // the bead was popped when it launched: put it back at the
+                    // front and pause, so a half-done tree is not handed to
+                    // the next bead behind the user's back.
+                    let Some(entry) = claim.entry else { continue };
+                    // Straight off disk: the TUI writes this file too, and the
+                    // in-memory copy is a tick old by now.
+                    let mut queue = queue::load_queue(self.bd.project());
+                    if queue::position(&queue, &id).is_none() {
+                        queue.insert(0, entry);
+                        let _ = queue::save_queue(self.bd.project(), &queue);
+                    }
+                    self.queue = queue;
+                    self.queue_paused = Some(format!("{id} was never claimed"));
+                }
                 if show_completions {
                     for issue in &data.issues {
                         let just_closed = issue.status == "closed"
@@ -353,6 +376,31 @@ impl Dashboard {
         cx.notify();
     }
 
+    fn toggle_priority_menu(&mut self, id: String, cx: &mut Context<Self>) {
+        self.priority_menu_for = if self.priority_menu_for.as_deref() == Some(id.as_str()) {
+            None
+        } else {
+            Some(id)
+        };
+        cx.notify();
+    }
+
+    fn close_priority_menu(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.priority_menu_for = None;
+        cx.notify();
+    }
+
+    fn choose_priority(&mut self, id: String, priority: u8, cx: &mut Context<Self>) {
+        self.priority_menu_for = None;
+        if let Err(error) = self.bd.set_priority(&id, priority) {
+            self.message = Some(error.to_string());
+        } else {
+            self.reload(cx);
+            self.selected = Some(id);
+        }
+        cx.notify();
+    }
+
     fn move_to_epic(&mut self, id: String, parent: Option<String>, cx: &mut Context<Self>) {
         if let Err(error) = self.bd.set_parent(&id, parent.as_deref()) {
             self.message = Some(error.to_string());
@@ -406,12 +454,12 @@ impl Dashboard {
         cx.notify();
     }
 
-    fn focus_working_agent(&mut self, name: String, cx: &mut Context<Self>) {
+    fn focus_working_agent(&mut self, target: String, cx: &mut Context<Self>) {
         self.working_menu_for = None;
         let cwd = self.bd.project().to_path_buf();
         let task = cx
             .background_executor()
-            .spawn(async move { herdr::focus_agent(&name, &cwd) });
+            .spawn(async move { herdr::focus_agent(&target, &cwd) });
         cx.spawn(async move |this, cx| {
             if let Err(error) = task.await {
                 this.update(cx, |dashboard, cx| {
@@ -438,7 +486,9 @@ impl Dashboard {
     }
 
     // An agent whose bead is no longer in progress does not count: agents
-    // outlive their bead (the tab stays open after the bead closes).
+    // outlive their bead (the tab stays open after the bead closes). An
+    // untracked tab counts like any other — it holds the same working tree,
+    // so launching into it would put two agents on one checkout.
     fn deck_busy(&self) -> bool {
         self.launching_agent.is_some()
             || self.queue_launching.is_some()
@@ -462,7 +512,8 @@ impl Dashboard {
         self.queue.retain(|item| item.id != entry.id);
         let _ = queue::save_queue(self.bd.project(), &self.queue);
         self.queue_launching = Some(entry.id.clone());
-        self.optimistic_claims.insert(entry.id.clone());
+        self.optimistic_claims
+            .insert(entry.id.clone(), queue::Claim::new(Some(entry.clone())));
         let label = entry.kind.label(entry.model.as_deref());
         self.agent_notice = Some((entry.id.clone(), false, format!("Queue: starting {label}…")));
         cx.notify();
@@ -478,6 +529,11 @@ impl Dashboard {
                 dashboard.queue_launching = None;
                 match result {
                     Ok(name) => {
+                        // The tab exists from here on, so a missing agent from
+                        // now on means it went away rather than never arrived.
+                        if let Some(claim) = dashboard.optimistic_claims.get_mut(&task_entry.id) {
+                            claim.launched = true;
+                        }
                         dashboard.agent_notice =
                             Some((task_entry.id.clone(), false, format!("Queue: started {name}")));
                     }
@@ -594,7 +650,8 @@ impl Dashboard {
         self.agent_menu_for = None;
         self.row_menu_for = None;
         self.launching_agent = Some(id.clone());
-        self.optimistic_claims.insert(id.clone());
+        self.optimistic_claims
+            .insert(id.clone(), queue::Claim::new(None));
         self.agent_notice = Some((id.clone(), false, format!("Starting {label}…")));
         cx.notify();
 
@@ -606,7 +663,12 @@ impl Dashboard {
             this.update(cx, |dashboard, cx| {
                 dashboard.launching_agent = None;
                 dashboard.agent_notice = Some(match result {
-                    Ok(name) => (id.clone(), false, format!("Started {label} as {name}")),
+                    Ok(name) => {
+                        if let Some(claim) = dashboard.optimistic_claims.get_mut(&id) {
+                            claim.launched = true;
+                        }
+                        (id.clone(), false, format!("Started {label} as {name}"))
+                    }
                     Err(error) => {
                         dashboard.optimistic_claims.remove(&id);
                         (id.clone(), true, error.to_string())
@@ -619,12 +681,8 @@ impl Dashboard {
         .detach();
     }
 
-    fn priority_pill(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let id = issue.id.clone();
-        let priority = issue.priority;
-        div()
-            .id(SharedString::from(format!("priority:{}", issue.id)))
-            .px_1()
+    fn priority_pill_base(pill: Stateful<Div>, priority: u8) -> Stateful<Div> {
+        pill.px_1()
             .rounded_sm()
             .bg(theme::priority(priority).opacity(0.14))
             .border_1()
@@ -633,11 +691,95 @@ impl Dashboard {
             .text_color(theme::priority(priority))
             .cursor_pointer()
             .hover(|style| style.bg(theme::priority(priority).opacity(0.25)))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            .child(format!("P{priority}"))
+    }
+
+    fn priority_pill(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let id = issue.id.clone();
+        let priority = issue.priority;
+        let pill = div().id(SharedString::from(format!("priority:{}", issue.id)));
+        Self::priority_pill_base(pill, priority).on_click(cx.listener(
+            move |this, _: &ClickEvent, _, cx| {
                 cx.stop_propagation();
                 this.cycle_priority(id.clone(), priority, cx);
+            },
+        ))
+    }
+
+    // Same pill, but clicking it opens a dropdown to jump straight to a
+    // priority instead of cycling through them one at a time.
+    fn priority_pill_editable(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let id = issue.id.clone();
+        let priority = issue.priority;
+        let menu_open = self.priority_menu_for.as_deref() == Some(issue.id.as_str());
+        let pill = div().id(SharedString::from(format!("priority-menu:{}", issue.id)));
+        Self::priority_pill_base(pill, priority)
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.toggle_priority_menu(id.clone(), cx);
             }))
-            .child(format!("P{priority}"))
+            .when(menu_open, |pill| {
+                pill.child(self.priority_menu(&issue.id, priority, cx))
+            })
+    }
+
+    fn priority_menu(
+        &self,
+        issue_id: &str,
+        current: u8,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        deferred(
+            anchored()
+                .anchor(Corner::TopLeft)
+                .offset(point(px(0.), px(20.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(
+                    div()
+                        .occlude()
+                        .w(px(72.))
+                        .rounded_md()
+                        .bg(theme::background())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .on_mouse_down_out(cx.listener(Self::close_priority_menu))
+                        .children((0..5).map(|priority| {
+                            let id = issue_id.to_owned();
+                            let selected = priority == current;
+                            div()
+                                .id(SharedString::from(format!(
+                                    "priority-option:{issue_id}:{priority}"
+                                )))
+                                .px_2()
+                                .py_1()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::surface_hover()))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.choose_priority(id.clone(), priority, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(theme::priority(priority))
+                                        .child(format!("P{priority}")),
+                                )
+                                .when(selected, |row| {
+                                    row.child(
+                                        div()
+                                            .text_size(px(9.))
+                                            .text_color(theme::accent())
+                                            .child("✓"),
+                                    )
+                                })
+                        })),
+                ),
+        )
+        .with_priority(1)
     }
 
     fn state_badge(&self, state: WorkState) -> Div {
@@ -910,7 +1052,13 @@ impl Dashboard {
                                         .text_xs()
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
                                         .text_color(theme::text())
-                                        .child(format!("{} · {}", agent.kind, item.issue.id)),
+                                        .child(match agent.external {
+                                            true => format!(
+                                                "{} · {} · external tab",
+                                                agent.kind, item.issue.id
+                                            ),
+                                            false => format!("{} · {}", agent.kind, item.issue.id),
+                                        }),
                                 )
                                 .child(div().flex_1())
                                 .when_some(agent.context_tokens, |header, tokens| {
@@ -966,7 +1114,7 @@ impl Dashboard {
         agent: &AgentInfo,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let focus_name = agent.name.clone();
+        let focus_target = agent.target.clone();
         let inspect_id = issue_id.to_owned();
         let refresh_id = issue_id.to_owned();
         deferred(
@@ -995,7 +1143,7 @@ impl Dashboard {
                                 .hover(|style| style.bg(theme::surface_hover()))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.focus_working_agent(focus_name.clone(), cx)
+                                    this.focus_working_agent(focus_target.clone(), cx)
                                 }))
                                 .child("Go to agent"),
                         )
@@ -1084,6 +1232,22 @@ impl Dashboard {
                     .when(is_hovered && agent.is_some() && !menu_open, |badge| {
                         badge.child(self.working_preview(&item, agent.as_ref().unwrap()))
                     }),
+            )
+            .when(
+                agent.as_ref().is_some_and(|agent| agent.external),
+                |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_size(px(9.))
+                            .text_color(theme::muted())
+                            .child("external"),
+                    )
+                },
             )
             .when_some(
                 agent.as_ref().and_then(|agent| agent.context_tokens),
@@ -1228,6 +1392,42 @@ impl Dashboard {
             )
     }
 
+    // Why the queue stopped, with the one click that starts it again. Shown
+    // beside the idle status row, or under a busy one — a pause the user
+    // cannot see is a queue that looks broken.
+    fn queue_paused_notice(&self, error: String, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme::danger())
+                    .child(format!("queue paused · {error}")),
+            )
+            .child(
+                div()
+                    .id("queue-resume")
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::border())
+                    .text_xs()
+                    .text_color(theme::text())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::raised_hover()))
+                    .on_click(cx.listener(|this, _, _, cx| this.resume_queue(cx)))
+                    .child("resume"),
+            )
+    }
+
     // The deck: a status row (what's running now, or a Run-next button when
     // idle) with the auto/manual toggle on the right, and the queue as a
     // vertical list underneath.
@@ -1296,32 +1496,7 @@ impl Dashboard {
                                 .items_center()
                                 .gap_2();
                             if let Some(error) = self.queue_paused.clone() {
-                                left.child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(theme::danger())
-                                        .child(format!("queue paused · {error}")),
-                                )
-                                .child(
-                                    div()
-                                        .id("queue-resume")
-                                        .flex_none()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(theme::border())
-                                        .text_xs()
-                                        .text_color(theme::text())
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(theme::raised_hover()))
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.resume_queue(cx)),
-                                        )
-                                        .child("resume"),
-                                )
+                                left.child(self.queue_paused_notice(error, cx))
                             } else if can_run_next {
                                 left.child(
                                     div()
@@ -1385,6 +1560,10 @@ impl Dashboard {
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_queue_auto(cx)))
                             .child(if self.queue_auto { "auto" } else { "manual" }),
                     ),
+            )
+            .when_some(
+                self.queue_paused.clone().filter(|_| has_work),
+                |console, error| console.child(self.queue_paused_notice(error, cx)),
             )
             .when(!self.queue.is_empty(), |console| {
                 console.child(
@@ -1683,7 +1862,12 @@ impl Dashboard {
         .with_priority(1)
     }
 
-    fn blocks_row(&self, node: &BlocksNode, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn dependency_row(
+        &self,
+        section: &str,
+        node: &BlocksNode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let issue = self.data.issue(&node.id).cloned();
         let known = issue.is_some();
         let (mark, mark_color) = match issue.as_ref().map(|issue| issue.status.as_str()) {
@@ -1697,7 +1881,7 @@ impl Dashboard {
         };
         let select_id = node.id.clone();
         div()
-            .id(SharedString::from(format!("blocks:{}", node.id)))
+            .id(SharedString::from(format!("{section}:{}", node.id)))
             .flex()
             .items_center()
             .gap_1()
@@ -1767,11 +1951,28 @@ impl Dashboard {
     // their dependents nested below — mirroring the TUI's BLOCKS section.
     fn blocks_section(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let nodes = self.data.blocks_tree(&issue.id);
+        self.dependency_tree_section("BLOCKS", "blocks", &nodes, cx)
+    }
+
+    // What is holding this bead up, as a tree: direct blockers at the root,
+    // their blockers nested below.
+    fn blocked_by_section(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let nodes = self.data.blocked_by_tree(&issue.id);
+        self.dependency_tree_section("BLOCKED BY", "blocked-by", &nodes, cx)
+    }
+
+    fn dependency_tree_section(
+        &self,
+        label: &'static str,
+        section: &'static str,
+        nodes: &[BlocksNode],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(div().text_xs().text_color(theme::muted()).child("BLOCKS"))
+            .child(div().text_xs().text_color(theme::muted()).child(label))
             .child(
                 div()
                     .flex()
@@ -1786,7 +1987,11 @@ impl Dashboard {
                                 .child("none"),
                         )
                     })
-                    .children(nodes.iter().map(|node| self.blocks_row(node, cx))),
+                    .children(
+                        nodes
+                            .iter()
+                            .map(|node| self.dependency_row(section, node, cx)),
+                    ),
             )
     }
 
@@ -1902,7 +2107,7 @@ impl Dashboard {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(self.priority_pill(issue, cx))
+                                    .child(self.priority_pill_editable(issue, cx))
                                     .child(self.state_badge(self.data.state(&issue.id)))
                                     .when_some(
                                         queue::position(&self.queue, &issue.id),
@@ -2010,6 +2215,7 @@ impl Dashboard {
                             }),
                         ))
                     })
+                    .child(self.blocked_by_section(issue, cx))
                     .child(self.blocks_section(issue, cx))
                     .when(can_move, |panel| {
                         panel.child(

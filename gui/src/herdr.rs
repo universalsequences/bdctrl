@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -15,12 +15,52 @@ use crate::model::Issue;
 
 #[derive(Clone, Debug)]
 pub struct AgentInfo {
-    pub name: String,
+    // What `herdr agent focus|read` accepts: the name we gave the agent at
+    // launch, or the pane id for a tab we did not start (herdr only names
+    // agents it was asked to start).
+    pub target: String,
     pub kind: String,
     pub status: String,
+    // Attributed to its bead from the tab itself — a terminal somebody opened
+    // by hand, not one beadsctrl launched.
+    pub external: bool,
     // Live context size of the agent's session, when its harness exposes one
     // (filled in by claude::attach_context for Claude sessions).
     pub context_tokens: Option<u64>,
+}
+
+// An agent pane living in this project, before we know which bead it is on.
+#[derive(Clone, Debug)]
+pub struct PaneAgent {
+    // Present only for agents herdr started under a name we chose.
+    pub name: Option<String>,
+    pub target: String,
+    pub pane: String,
+    pub kind: String,
+    pub status: String,
+    // Transcript path, when the agent's harness reports its session to herdr
+    // (`herdr integration install claude`). Absent otherwise.
+    pub session_path: Option<PathBuf>,
+}
+
+impl PaneAgent {
+    pub fn info(&self, external: bool) -> AgentInfo {
+        AgentInfo {
+            target: self.target.clone(),
+            kind: self.kind.clone(),
+            status: self.status.clone(),
+            external,
+            context_tokens: None,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Discovery {
+    pub by_bead: HashMap<String, AgentInfo>,
+    // Panes in this project that no launched-agent name accounted for: the
+    // candidates for attribution from their transcript or terminal output.
+    pub unclaimed: Vec<PaneAgent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -106,72 +146,82 @@ pub fn launch_agent(
     Ok(name)
 }
 
-pub fn discover_agents(issues: &[Issue], cwd: &Path) -> HashMap<String, AgentInfo> {
+pub fn discover_agents(issues: &[Issue], cwd: &Path) -> Discovery {
+    let mut discovery = Discovery::default();
     if env::var("HERDR_ENV").as_deref() != Ok("1") {
-        return HashMap::new();
+        return discovery;
     }
-    let Ok(raw) = run_herdr(&["agent".into(), "list".into()], cwd) else {
-        return HashMap::new();
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return HashMap::new();
-    };
-    let Some(agents) = value["result"]["agents"].as_array() else {
-        return HashMap::new();
-    };
-    let project = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let mut result = HashMap::new();
-    for issue in issues {
-        let prefix = format!(
-            "{}-",
-            safe_agent_base(&issue.id)
-                .chars()
-                .take(26)
-                .collect::<String>()
-        );
-        let Some(agent) = agents.iter().find(|agent| {
-            let same_project = agent["cwd"].as_str().is_some_and(|path| {
-                Path::new(path)
-                    .canonicalize()
-                    .unwrap_or_else(|_| Path::new(path).to_path_buf())
-                    == project
-            });
-            same_project
-                && agent["name"]
-                    .as_str()
-                    .is_some_and(|name| name.starts_with(&prefix))
-        }) else {
-            continue;
-        };
-        let Some(name) = agent["name"].as_str() else {
-            continue;
-        };
-        result.insert(
-            issue.id.clone(),
-            AgentInfo {
-                name: name.into(),
-                kind: agent["agent"].as_str().unwrap_or("agent").into(),
-                status: agent["agent_status"].as_str().unwrap_or("unknown").into(),
-                context_tokens: None,
-            },
-        );
+    let prefixes: Vec<(String, &Issue)> = issues
+        .iter()
+        .map(|issue| {
+            let base: String = safe_agent_base(&issue.id).chars().take(26).collect();
+            (format!("{base}-"), issue)
+        })
+        .collect();
+    for pane in project_agents(cwd) {
+        let bead = pane.name.as_deref().and_then(|name| {
+            prefixes
+                .iter()
+                .filter(|(prefix, _)| name.starts_with(prefix.as_str()))
+                // The most specific prefix wins: an agent launched for `x.7`
+                // is named after both that bead and its parent `x`.
+                .max_by_key(|(prefix, _)| prefix.len())
+                .map(|(_, issue)| issue.id.clone())
+        });
+        match bead {
+            Some(bead) if !discovery.by_bead.contains_key(&bead) => {
+                discovery.by_bead.insert(bead, pane.info(false));
+            }
+            _ => discovery.unclaimed.push(pane),
+        }
     }
-    result
+    discovery
 }
 
-pub fn read_agent_preview(name: &str, cwd: &Path) -> Result<Vec<String>> {
-    let raw = run_herdr(
-        &[
-            "agent".into(),
-            "read".into(),
-            name.into(),
-            "--source".into(),
-            "recent-unwrapped".into(),
-            "--lines".into(),
-            "30".into(),
-        ],
-        cwd,
-    )?;
+// Every agent pane whose directory sits inside the project — including tabs
+// opened in a subdirectory, which is where hand-started agents usually live.
+fn project_agents(project: &Path) -> Vec<PaneAgent> {
+    let Ok(raw) = run_herdr(&["agent".into(), "list".into()], project) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(agents) = value["result"]["agents"].as_array() else {
+        return Vec::new();
+    };
+    let root = canonical(project);
+    agents
+        .iter()
+        .filter_map(|agent| {
+            ["cwd", "foreground_cwd"]
+                .iter()
+                .filter_map(|key| agent[*key].as_str())
+                .map(|path| canonical(Path::new(path)))
+                .find(|path| path.starts_with(&root))?;
+            let pane = agent["pane_id"].as_str()?;
+            let name = agent["name"].as_str().map(str::to_owned);
+            Some(PaneAgent {
+                target: name.clone().unwrap_or_else(|| pane.to_owned()),
+                pane: pane.to_owned(),
+                name,
+                kind: agent["agent"].as_str().unwrap_or("agent").into(),
+                status: agent["agent_status"].as_str().unwrap_or("unknown").into(),
+                session_path: agent["agent_session_path"]
+                    .as_str()
+                    .map(PathBuf::from)
+                    .filter(|path| path.exists()),
+            })
+        })
+        .collect()
+}
+
+pub fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub fn read_agent_preview(target: &str, cwd: &Path) -> Result<Vec<String>> {
+    let raw = read_agent_text(target, cwd, 30)?;
     let mut lines = Vec::new();
     for line in raw.lines() {
         let trimmed = line.trim().trim_matches('│').trim();
@@ -198,6 +248,23 @@ pub fn read_agent_preview(name: &str, cwd: &Path) -> Result<Vec<String>> {
     Ok(lines)
 }
 
+// Raw terminal tail for a pane. `recent-unwrapped` keeps long command lines in
+// one piece, which is what bead-id matching needs.
+pub fn read_agent_text(target: &str, cwd: &Path, lines: u32) -> Result<String> {
+    run_herdr(
+        &[
+            "agent".into(),
+            "read".into(),
+            target.into(),
+            "--source".into(),
+            "recent-unwrapped".into(),
+            "--lines".into(),
+            lines.to_string(),
+        ],
+        cwd,
+    )
+}
+
 // Terminal harnesses (Claude Code especially) fill the visible tail with
 // status chrome — spinner lines, footer tips, the input box — which drowns
 // out the transcript the preview is for.
@@ -217,8 +284,8 @@ fn is_harness_chrome(line: &str) -> bool {
         || lower.contains("context left")
 }
 
-pub fn focus_agent(name: &str, cwd: &Path) -> Result<()> {
-    run_herdr(&["agent".into(), "focus".into(), name.into()], cwd).map(drop)
+pub fn focus_agent(target: &str, cwd: &Path) -> Result<()> {
+    run_herdr(&["agent".into(), "focus".into(), target.into()], cwd).map(drop)
 }
 
 fn workspace_for_project(cwd: &Path) -> Result<Option<String>> {

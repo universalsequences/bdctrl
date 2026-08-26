@@ -79,6 +79,8 @@ pub struct DashboardData {
     pub states: HashMap<String, WorkState>,
     // blocker id -> ids of the beads it blocks
     pub dependents: HashMap<String, Vec<String>>,
+    // blocked id -> ids of the beads that block it
+    pub blocked_by: HashMap<String, Vec<String>>,
 }
 
 // One row of the flattened blocks tree shown in the inspector: the prefix
@@ -129,6 +131,7 @@ impl DashboardData {
         let mut parent_by_child = HashMap::<&str, &str>::new();
         let mut blockers = HashMap::<&str, Vec<&str>>::new();
         let mut dependents = HashMap::<String, Vec<String>>::new();
+        let mut blocked_by = HashMap::<String, Vec<String>>::new();
         for issue in &issues {
             for dependency in &issue.dependencies {
                 if dependency.kind == "parent-child" {
@@ -146,6 +149,10 @@ impl DashboardData {
                         .or_default();
                     if !blocked.contains(&dependency.issue_id) {
                         blocked.push(dependency.issue_id.clone());
+                    }
+                    let blocking = blocked_by.entry(dependency.issue_id.clone()).or_default();
+                    if !blocking.contains(&dependency.depends_on_id) {
+                        blocking.push(dependency.depends_on_id.clone());
                     }
                 }
             }
@@ -244,15 +251,28 @@ impl DashboardData {
             ungrouped,
             states,
             dependents,
+            blocked_by,
         }
     }
 
+    // What this bead is holding up: dependents of `root`, nested recursively.
     pub fn blocks_tree(&self, root: &str) -> Vec<BlocksNode> {
+        self.dependency_tree(root, &self.dependents)
+    }
+
+    // What is holding this bead up: its blockers, and their blockers, nested
+    // recursively.
+    pub fn blocked_by_tree(&self, root: &str) -> Vec<BlocksNode> {
+        self.dependency_tree(root, &self.blocked_by)
+    }
+
+    fn dependency_tree(&self, root: &str, edges: &HashMap<String, Vec<String>>) -> Vec<BlocksNode> {
         let mut nodes = Vec::new();
-        let children = self.sorted_dependents(root);
+        let children = self.sorted_edges(edges, root);
         let ancestors = HashSet::from([root.to_owned()]);
         for (index, child) in children.iter().enumerate() {
-            self.push_blocks_node(
+            self.push_tree_node(
+                edges,
                 child,
                 "",
                 index == children.len() - 1,
@@ -265,8 +285,8 @@ impl DashboardData {
 
     // Open work first, then priority, then id — closed beads sink so the tree
     // leads with what is still waiting.
-    fn sorted_dependents(&self, id: &str) -> Vec<String> {
-        let mut children = self.dependents.get(id).cloned().unwrap_or_default();
+    fn sorted_edges(&self, edges: &HashMap<String, Vec<String>>, id: &str) -> Vec<String> {
+        let mut children = edges.get(id).cloned().unwrap_or_default();
         children.sort_by(|a, b| {
             let left = self.issue(a);
             let right = self.issue(b);
@@ -281,8 +301,9 @@ impl DashboardData {
         children
     }
 
-    fn push_blocks_node(
+    fn push_tree_node(
         &self,
+        edges: &HashMap<String, Vec<String>>,
         id: &str,
         prefix: &str,
         last: bool,
@@ -298,7 +319,7 @@ impl DashboardData {
         if cycle {
             return;
         }
-        let children = self.sorted_dependents(id);
+        let children = self.sorted_edges(edges, id);
         if children.is_empty() {
             return;
         }
@@ -306,7 +327,8 @@ impl DashboardData {
         next_ancestors.insert(id.to_owned());
         let next_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
         for (index, child) in children.iter().enumerate() {
-            self.push_blocks_node(
+            self.push_tree_node(
+                edges,
                 child,
                 &next_prefix,
                 index == children.len() - 1,
@@ -401,5 +423,22 @@ mod tests {
         let nodes = cyclic.blocks_tree("a");
         assert_eq!(nodes.len(), 2);
         assert!(nodes[1].cycle, "revisiting the root must stop the walk");
+    }
+
+    #[test]
+    fn blocked_by_tree_walks_the_reverse_edge() {
+        let raw = r#"
+{"id":"root","title":"Root","status":"open","priority":1,"issue_type":"task"}
+{"id":"hot","title":"Hot","status":"open","priority":0,"issue_type":"task","dependencies":[{"issue_id":"hot","depends_on_id":"root","type":"blocks"}]}
+{"id":"leaf","title":"Leaf","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"leaf","depends_on_id":"hot","type":"blocks"}]}
+"#;
+        let data = DashboardData::from_export(raw).unwrap();
+        let nodes = data.blocked_by_tree("leaf");
+        let rows: Vec<_> = nodes
+            .iter()
+            .map(|node| format!("{}{}", node.prefix, node.id))
+            .collect();
+        assert_eq!(rows, vec!["└─ hot", "   └─ root"]);
+        assert!(data.blocked_by_tree("root").is_empty());
     }
 }

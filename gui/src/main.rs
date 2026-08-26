@@ -1,3 +1,4 @@
+mod agents;
 mod bd;
 mod claude;
 mod dashboard;
