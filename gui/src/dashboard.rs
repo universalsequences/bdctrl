@@ -23,6 +23,15 @@ use crate::{
 
 actions!(dashboard, [FocusSearch]);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DashboardFilter {
+    All,
+    Open,
+    Ready,
+    Working,
+    Closed,
+}
+
 pub struct Dashboard {
     bd: BdClient,
     data: DashboardData,
@@ -33,6 +42,7 @@ pub struct Dashboard {
     focus_handle: FocusHandle,
     search_open: bool,
     search_query: String,
+    filter: DashboardFilter,
     agent_menu_for: Option<String>,
     priority_menu_for: Option<String>,
     row_menu_for: Option<String>,
@@ -119,6 +129,7 @@ impl Dashboard {
             focus_handle: cx.focus_handle(),
             search_open: false,
             search_query: String::new(),
+            filter: DashboardFilter::All,
             agent_menu_for: None,
             priority_menu_for: None,
             row_menu_for: None,
@@ -782,6 +793,65 @@ impl Dashboard {
         .with_priority(1)
     }
 
+    fn issue_matches_filter(&self, issue: &Issue) -> bool {
+        match self.filter {
+            DashboardFilter::All => issue.status != "closed",
+            DashboardFilter::Open => matches!(
+                self.data.state(&issue.id),
+                WorkState::Ready | WorkState::Blocked
+            ),
+            DashboardFilter::Ready => self.data.state(&issue.id) == WorkState::Ready,
+            DashboardFilter::Working => self.data.state(&issue.id) == WorkState::InProgress,
+            DashboardFilter::Closed => self.data.state(&issue.id) == WorkState::Closed,
+        }
+    }
+
+    fn set_filter(&mut self, filter: DashboardFilter, cx: &mut Context<Self>) {
+        self.filter = if self.filter == filter {
+            DashboardFilter::All
+        } else {
+            filter
+        };
+        cx.notify();
+    }
+
+    fn filter_stat(
+        &self,
+        label: &'static str,
+        value: usize,
+        color: Hsla,
+        filter: DashboardFilter,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let selected = self.filter == filter;
+        div()
+            .id(SharedString::from(format!("filter:{label}")))
+            .px_2()
+            .py_1()
+            .flex()
+            .items_baseline()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(if selected {
+                color.opacity(0.45)
+            } else {
+                gpui::transparent_black()
+            })
+            .when(selected, |stat| stat.bg(color.opacity(0.12)))
+            .cursor_pointer()
+            .hover(|style| style.bg(color.opacity(0.1)))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_filter(filter, cx)))
+            .text_xs()
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(color)
+                    .child(value.to_string()),
+            )
+            .child(div().text_color(theme::muted()).child(label))
+    }
+
     fn state_badge(&self, state: WorkState) -> Div {
         let (label, color) = match state {
             WorkState::Ready => ("READY", theme::ready()),
@@ -885,11 +955,8 @@ impl Dashboard {
             .children
             .iter()
             .filter(|child| {
-                if query.is_empty() || epic_matches {
-                    child.status != "closed"
-                } else {
-                    issue_matches(child, query)
-                }
+                self.issue_matches_filter(child)
+                    && (query.is_empty() || epic_matches || issue_matches(child, query))
             })
             .collect();
         let progress = summary.progress();
@@ -998,11 +1065,8 @@ impl Dashboard {
                     .ungrouped
                     .iter()
                     .filter(|issue| {
-                        if query.is_empty() {
-                            issue.status != "closed"
-                        } else {
-                            issue_matches(issue, query)
-                        }
+                        self.issue_matches_filter(issue)
+                            && (query.is_empty() || issue_matches(issue, query))
                     })
                     .map(|issue| self.issue_row(issue, cx)),
             )
@@ -1015,6 +1079,80 @@ impl Dashboard {
                         .child("Everything has a home"),
                 )
             })
+    }
+
+    fn closed_card(
+        &self,
+        issues: Vec<&Issue>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        div()
+            .w_full()
+            .max_w(px(900.))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .rounded_lg()
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::border())
+            .child(
+                div()
+                    .pb_2()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child("Recently closed"),
+            )
+            .children(issues.into_iter().map(|issue| {
+                let id = issue.id.clone();
+                let closed_at = issue
+                    .closed_at
+                    .as_deref()
+                    .or(issue.updated_at.as_deref())
+                    .map(format_closed_at)
+                    .unwrap_or_else(|| "Unknown date".into());
+                div()
+                    .id(SharedString::from(format!("closed:{}", issue.id)))
+                    .w_full()
+                    .px_2()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::surface_hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select(id.clone(), cx)))
+                    .child(
+                        div()
+                            .w(px(116.))
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(closed_at),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.))
+                            .flex_none()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(issue.id.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(theme::text())
+                            .child(issue.title.clone()),
+                    )
+                    .child(self.state_badge(WorkState::Closed))
+            }))
     }
 
     fn working_preview(&self, item: &WorkingItem, agent: &AgentInfo) -> impl IntoElement + use<> {
@@ -2332,6 +2470,13 @@ fn issue_matches(issue: &Issue, query: &str) -> bool {
 impl Render for Dashboard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let stats = self.data.stats();
+        // Leave room for macOS traffic lights when content extends into the
+        // transparent titlebar. Other platforms retain the original inset.
+        let titlebar_left_padding = if cfg!(target_os = "macos") {
+            px(80.)
+        } else {
+            px(16.)
+        };
         let bottom_inspector = window.bounds().size.width < px(820.);
         let selected = self
             .selected
@@ -2384,22 +2529,37 @@ impl Render for Dashboard {
             .iter()
             .zip(epic_anchors)
             .filter(|(epic, _)| {
-                query.is_empty()
-                    || issue_matches(&epic.epic, &query)
-                    || epic
-                        .children
-                        .iter()
-                        .any(|issue| issue_matches(issue, &query))
+                (self.issue_matches_filter(&epic.epic)
+                    && (query.is_empty() || issue_matches(&epic.epic, &query)))
+                    || epic.children.iter().any(|issue| {
+                        self.issue_matches_filter(issue)
+                            && (query.is_empty() || issue_matches(issue, &query))
+                    })
             })
             .collect();
-        let show_ungrouped = !self.data.ungrouped.is_empty()
-            && (query.is_empty()
-                || self
-                    .data
-                    .ungrouped
-                    .iter()
-                    .any(|issue| issue_matches(issue, &query)));
-        let has_results = !visible_epics.is_empty() || show_ungrouped;
+        let show_ungrouped = self.data.ungrouped.iter().any(|issue| {
+            self.issue_matches_filter(issue)
+                && (query.is_empty() || issue_matches(issue, &query))
+        });
+        let mut closed_issues: Vec<_> = self
+            .data
+            .issues
+            .iter()
+            .filter(|issue| {
+                issue.status == "closed" && (query.is_empty() || issue_matches(issue, &query))
+            })
+            .collect();
+        closed_issues.sort_by(|left, right| {
+            closure_time(right)
+                .cmp(closure_time(left))
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        closed_issues.truncate(100);
+        let has_results = if self.filter == DashboardFilter::Closed {
+            !closed_issues.is_empty()
+        } else {
+            !visible_epics.is_empty() || show_ungrouped
+        };
 
         div()
             .size_full()
@@ -2448,7 +2608,8 @@ impl Render for Dashboard {
                     .child(
                         div()
                             .h(px(46.))
-                            .px_4()
+                            .pl(titlebar_left_padding)
+                            .pr_4()
                             .flex()
                             .items_center()
                             .gap_3()
@@ -2462,10 +2623,34 @@ impl Render for Dashboard {
                             )
                             .child(div().text_xs().text_color(theme::muted()).child(project))
                             .child(div().w(px(1.)).h(px(18.)).bg(theme::border()))
-                            .child(stat("open", stats.open, theme::text()))
-                            .child(stat("ready", stats.ready, theme::ready()))
-                            .child(stat("working", stats.in_progress, theme::progress()))
-                            .child(stat("closed", stats.closed, theme::muted()))
+                            .child(self.filter_stat(
+                                "open",
+                                stats.open,
+                                theme::text(),
+                                DashboardFilter::Open,
+                                cx,
+                            ))
+                            .child(self.filter_stat(
+                                "ready",
+                                stats.ready,
+                                theme::ready(),
+                                DashboardFilter::Ready,
+                                cx,
+                            ))
+                            .child(self.filter_stat(
+                                "working",
+                                stats.in_progress,
+                                theme::progress(),
+                                DashboardFilter::Working,
+                                cx,
+                            ))
+                            .child(self.filter_stat(
+                                "closed",
+                                stats.closed,
+                                theme::muted(),
+                                DashboardFilter::Closed,
+                                cx,
+                            ))
                             .child(div().flex_1())
                             .when(self.search_open || !query.is_empty(), |toolbar| {
                                 toolbar.child(
@@ -2565,12 +2750,20 @@ impl Render for Dashboard {
                                     .flex_wrap()
                                     .items_start()
                                     .gap_3()
-                                    .children(visible_epics.into_iter().map(|(epic, anchor)| {
-                                        self.epic_card(epic, anchor, &query, cx)
-                                    }))
-                                    .when(show_ungrouped, |grid| {
-                                        grid.child(self.ungrouped_card(&query, cx))
+                                    .when(self.filter != DashboardFilter::Closed, |grid| {
+                                        grid.children(visible_epics.into_iter().map(
+                                            |(epic, anchor)| {
+                                                self.epic_card(epic, anchor, &query, cx)
+                                            },
+                                        ))
+                                        .when(show_ungrouped, |grid| {
+                                            grid.child(self.ungrouped_card(&query, cx))
+                                        })
                                     })
+                                    .when(
+                                        self.filter == DashboardFilter::Closed && has_results,
+                                        |grid| grid.child(self.closed_card(closed_issues, cx)),
+                                    )
                                     .when(!has_results, |grid| {
                                         grid.child(
                                             div()
@@ -2578,10 +2771,11 @@ impl Render for Dashboard {
                                                 .py_8()
                                                 .text_sm()
                                                 .text_color(theme::muted())
-                                                .child(format!(
-                                                    "No beads or epics match ‘{}’",
-                                                    query
-                                                )),
+                                                .child(if query.is_empty() {
+                                                    "No beads match this filter".to_owned()
+                                                } else {
+                                                    format!("No beads match ‘{}’", query)
+                                                }),
                                         )
                                     }),
                             ),
@@ -2631,19 +2825,19 @@ fn agent_status_color(status: &str) -> Hsla {
     }
 }
 
-fn stat(label: &'static str, value: usize, color: Hsla) -> Div {
-    div()
-        .flex()
-        .items_baseline()
-        .gap_1()
-        .text_xs()
-        .child(
-            div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(color)
-                .child(value.to_string()),
-        )
-        .child(div().text_color(theme::muted()).child(label))
+fn closure_time(issue: &Issue) -> &str {
+    issue
+        .closed_at
+        .as_deref()
+        .or(issue.updated_at.as_deref())
+        .unwrap_or("")
+}
+
+fn format_closed_at(timestamp: &str) -> String {
+    match (timestamp.get(..10), timestamp.get(11..16)) {
+        (Some(date), Some(time)) => format!("{date} {time}"),
+        _ => timestamp.to_owned(),
+    }
 }
 
 pub fn init(cx: &mut App) {
@@ -2659,6 +2853,7 @@ pub fn window_options(cx: &mut App) -> WindowOptions {
         ))),
         titlebar: Some(gpui::TitlebarOptions {
             title: Some("beadsctrl".into()),
+            appears_transparent: true,
             ..Default::default()
         }),
         app_id: Some("beadsctrl".into()),

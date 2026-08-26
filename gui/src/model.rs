@@ -30,6 +30,10 @@ pub struct Issue {
     pub labels: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
+    #[serde(default)]
+    pub closed_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 fn untitled() -> String {
