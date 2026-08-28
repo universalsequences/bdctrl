@@ -5,11 +5,11 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, ClickEvent, Context, Corner, Div, FocusHandle, Focusable, Hsla,
-    IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Render, ScrollAnchor, ScrollHandle, SharedString,
-    Stateful, Styled, Window, WindowBounds, WindowOptions, actions, anchored, deferred, div,
-    point, prelude::*, px, relative, size,
+    App, Bounds, ClickEvent, Context, Corner, Div, FocusHandle, Focusable, Hsla, IntoElement,
+    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Render, ScrollAnchor, ScrollHandle, ScrollWheelEvent, SharedString,
+    Stateful, Styled, Window, WindowBounds, WindowOptions, actions, anchored, deferred, div, point,
+    prelude::*, px, relative, size,
 };
 
 use crate::{
@@ -38,6 +38,9 @@ pub struct Dashboard {
     selected: Option<String>,
     message: Option<String>,
     dashboard_scroll: ScrollHandle,
+    // Incrementing this invalidates the previous Linux kinetic-scroll task.
+    #[cfg(target_os = "linux")]
+    scroll_momentum_generation: u64,
     completed_toast: Vec<Issue>,
     focus_handle: FocusHandle,
     search_open: bool,
@@ -45,6 +48,9 @@ pub struct Dashboard {
     filter: DashboardFilter,
     agent_menu_for: Option<String>,
     priority_menu_for: Option<String>,
+    state_menu_for: Option<String>,
+    close_dialog_for: Option<String>,
+    close_reason: String,
     row_menu_for: Option<String>,
     launching_agent: Option<String>,
     agent_notice: Option<(String, bool, String)>,
@@ -125,6 +131,8 @@ impl Dashboard {
             selected: None,
             message,
             dashboard_scroll: ScrollHandle::new(),
+            #[cfg(target_os = "linux")]
+            scroll_momentum_generation: 0,
             completed_toast: Vec::new(),
             focus_handle: cx.focus_handle(),
             search_open: false,
@@ -132,6 +140,9 @@ impl Dashboard {
             filter: DashboardFilter::All,
             agent_menu_for: None,
             priority_menu_for: None,
+            state_menu_for: None,
+            close_dialog_for: None,
+            close_reason: String::new(),
             row_menu_for: None,
             launching_agent: None,
             agent_notice: None,
@@ -146,6 +157,68 @@ impl Dashboard {
             queue_paused: None,
             queue_launching: None,
             optimistic_claims: HashMap::new(),
+        }
+    }
+
+    fn dashboard_scroll_wheel(
+        &mut self,
+        _event: &ScrollWheelEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // Cocoa supplies momentum events itself. GPUI's Linux backends do not,
+        // so add a short decaying tail to wheel and touchpad deltas here only.
+        #[cfg(target_os = "linux")]
+        {
+            let delta = _event.delta.pixel_delta(_window.line_height());
+            let delta_y = if delta.y == Pixels::ZERO {
+                delta.x
+            } else {
+                delta.y
+            };
+            if delta_y == Pixels::ZERO {
+                return;
+            }
+
+            self.scroll_momentum_generation = self.scroll_momentum_generation.wrapping_add(1);
+            let generation = self.scroll_momentum_generation;
+            let handle = self.dashboard_scroll.clone();
+            let mut velocity = delta_y * 0.32;
+
+            _cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(16))
+                        .await;
+                    velocity *= 0.84;
+                    if velocity.abs() < px(0.35) {
+                        break;
+                    }
+
+                    let keep_going = this
+                        .update(cx, |dashboard, cx| {
+                            if dashboard.scroll_momentum_generation != generation {
+                                return false;
+                            }
+
+                            let offset = handle.offset();
+                            let next_y = (offset.y + velocity)
+                                .clamp(-handle.max_offset().height, Pixels::ZERO);
+                            if next_y == offset.y {
+                                return false;
+                            }
+
+                            handle.set_offset(point(offset.x, next_y));
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !keep_going {
+                        break;
+                    }
+                }
+            })
+            .detach();
         }
     }
 
@@ -176,6 +249,7 @@ impl Dashboard {
                 scan = result.2;
                 if this
                     .update(cx, |dashboard, cx| {
+                        theme::refresh();
                         dashboard.agents = result.1;
                         dashboard.apply_load(result.0, true, cx);
                         dashboard.queue_tick(cx);
@@ -317,6 +391,30 @@ impl Dashboard {
     }
 
     fn search_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.close_dialog_for.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => self.cancel_close(cx),
+                "backspace" => {
+                    self.close_reason.pop();
+                    cx.notify();
+                }
+                "enter" => self.confirm_close(cx),
+                _ if !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                    && !event.keystroke.modifiers.platform =>
+                {
+                    if let Some(text) = &event.keystroke.key_char
+                        && text.chars().all(|character| !character.is_control())
+                    {
+                        self.close_reason.push_str(text);
+                        cx.notify();
+                    }
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
         if !self.search_open {
             return;
         }
@@ -409,6 +507,80 @@ impl Dashboard {
             self.reload(cx);
             self.selected = Some(id);
         }
+        cx.notify();
+    }
+
+    fn toggle_state_menu(&mut self, id: String, cx: &mut Context<Self>) {
+        self.state_menu_for = if self.state_menu_for.as_deref() == Some(id.as_str()) {
+            None
+        } else {
+            Some(id)
+        };
+        cx.notify();
+    }
+
+    fn close_state_menu(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.state_menu_for = None;
+        cx.notify();
+    }
+
+    fn choose_status(
+        &mut self,
+        id: String,
+        current: String,
+        status: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.state_menu_for = None;
+        if current == status {
+            cx.notify();
+            return;
+        }
+        if status == "closed" {
+            self.close_dialog_for = Some(id);
+            self.close_reason.clear();
+            cx.notify();
+            return;
+        }
+
+        let result = if current == "closed" {
+            self.bd.reopen(&id).and_then(|_| {
+                if status == "open" {
+                    Ok(())
+                } else {
+                    self.bd.set_status(&id, status)
+                }
+            })
+        } else {
+            self.bd.set_status(&id, status)
+        };
+        if let Err(error) = result {
+            self.message = Some(error.to_string());
+        } else {
+            self.reload(cx);
+            self.selected = Some(id);
+        }
+        cx.notify();
+    }
+
+    fn cancel_close(&mut self, cx: &mut Context<Self>) {
+        self.close_dialog_for = None;
+        self.close_reason.clear();
+        cx.notify();
+    }
+
+    fn confirm_close(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.close_dialog_for.take() else {
+            return;
+        };
+        let reason = self.close_reason.trim();
+        if let Err(error) = self.bd.close(&id, (!reason.is_empty()).then_some(reason)) {
+            self.message = Some(error.to_string());
+        } else {
+            self.reload(cx);
+            self.selected = Some(id);
+        }
+        self.close_reason.clear();
         cx.notify();
     }
 
@@ -545,8 +717,11 @@ impl Dashboard {
                         if let Some(claim) = dashboard.optimistic_claims.get_mut(&task_entry.id) {
                             claim.launched = true;
                         }
-                        dashboard.agent_notice =
-                            Some((task_entry.id.clone(), false, format!("Queue: started {name}")));
+                        dashboard.agent_notice = Some((
+                            task_entry.id.clone(),
+                            false,
+                            format!("Queue: started {name}"),
+                        ));
                     }
                     Err(error) => {
                         // Back at the front and pause: the queue retries once
@@ -719,7 +894,11 @@ impl Dashboard {
 
     // Same pill, but clicking it opens a dropdown to jump straight to a
     // priority instead of cycling through them one at a time.
-    fn priority_pill_editable(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn priority_pill_editable(
+        &self,
+        issue: &Issue,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let id = issue.id.clone();
         let priority = issue.priority;
         let menu_open = self.priority_menu_for.as_deref() == Some(issue.id.as_str());
@@ -871,6 +1050,83 @@ impl Dashboard {
             .child(label)
     }
 
+    fn state_badge_editable(
+        &self,
+        issue: &Issue,
+        location: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let menu_key = format!("{location}:{}", issue.id);
+        let toggle_key = menu_key.clone();
+        let state = self.data.state(&issue.id);
+        let menu_open = self.state_menu_for.as_deref() == Some(menu_key.as_str());
+        self.state_badge(state)
+            .id(SharedString::from(format!("state-menu:{menu_key}")))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_hover()))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.toggle_state_menu(toggle_key.clone(), cx);
+            }))
+            .when(menu_open, |badge| badge.child(self.state_menu(issue, cx)))
+    }
+
+    fn state_menu(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let options = [
+            ("open", "OPEN", theme::ready()),
+            ("in_progress", "IN PROGRESS", theme::progress()),
+            ("closed", "CLOSED", theme::muted()),
+        ];
+        deferred(
+            anchored()
+                .anchor(Corner::TopLeft)
+                .offset(point(px(0.), px(20.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(
+                    div()
+                        .occlude()
+                        .w(px(132.))
+                        .rounded_md()
+                        .bg(theme::background())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .on_mouse_down_out(cx.listener(Self::close_state_menu))
+                        .children(options.into_iter().map(|(status, label, color)| {
+                            let id = issue.id.clone();
+                            let current = issue.status.clone();
+                            let selected = current == status;
+                            div()
+                                .id(SharedString::from(format!(
+                                    "state-option:{}:{status}",
+                                    issue.id
+                                )))
+                                .px_2()
+                                .py_1()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::surface_hover()))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.choose_status(id.clone(), current.clone(), status, cx);
+                                }))
+                                .child(div().text_size(px(10.)).text_color(color).child(label))
+                                .when(selected, |row| {
+                                    row.child(
+                                        div()
+                                            .text_size(px(9.))
+                                            .text_color(theme::accent())
+                                            .child("✓"),
+                                    )
+                                })
+                        })),
+                ),
+        )
+        .with_priority(1)
+    }
+
     fn issue_row(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let state = self.data.state(&issue.id);
         let id = issue.id.clone();
@@ -939,7 +1195,7 @@ impl Dashboard {
             .when_some(queue::position(&self.queue, &issue.id), |row, index| {
                 row.child(self.queued_badge(index))
             })
-            .child(self.state_badge(state))
+            .child(self.state_badge_editable(issue, "row", cx))
     }
 
     fn epic_card(
@@ -1081,11 +1337,7 @@ impl Dashboard {
             })
     }
 
-    fn closed_card(
-        &self,
-        issues: Vec<&Issue>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    fn closed_card(&self, issues: Vec<&Issue>, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         div()
             .w_full()
             .max_w(px(900.))
@@ -1151,7 +1403,7 @@ impl Dashboard {
                             .text_color(theme::text())
                             .child(issue.title.clone()),
                     )
-                    .child(self.state_badge(WorkState::Closed))
+                    .child(self.state_badge_editable(issue, "closed", cx))
             }))
     }
 
@@ -1371,22 +1623,19 @@ impl Dashboard {
                         badge.child(self.working_preview(&item, agent.as_ref().unwrap()))
                     }),
             )
-            .when(
-                agent.as_ref().is_some_and(|agent| agent.external),
-                |row| {
-                    row.child(
-                        div()
-                            .flex_none()
-                            .px_1()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(theme::border())
-                            .text_size(px(9.))
-                            .text_color(theme::muted())
-                            .child("external"),
-                    )
-                },
-            )
+            .when(agent.as_ref().is_some_and(|agent| agent.external), |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme::border())
+                        .text_size(px(9.))
+                        .text_color(theme::muted())
+                        .child("external"),
+                )
+            })
             .when_some(
                 agent.as_ref().and_then(|agent| agent.context_tokens),
                 |row, tokens| {
@@ -1474,16 +1723,22 @@ impl Dashboard {
             .drag_over::<DraggedQueueEntry>(|style, _, _, _| {
                 style.bg(theme::accent().opacity(0.12))
             })
-            .on_drop(cx.listener(move |this, dragged: &DraggedQueueEntry, _, cx| {
-                this.move_queued(&dragged.id, Some(&drop_id), cx);
-            }))
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedQueueEntry, _, cx| {
+                    this.move_queued(&dragged.id, Some(&drop_id), cx);
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| this.select(click_id.clone(), cx)))
             .child(
                 div()
                     .w(px(16.))
                     .flex_none()
                     .text_xs()
-                    .text_color(if is_next { theme::ready() } else { theme::muted() })
+                    .text_color(if is_next {
+                        theme::ready()
+                    } else {
+                        theme::muted()
+                    })
                     .child(format!("{}", index + 1)),
             )
             .child(
@@ -1533,7 +1788,11 @@ impl Dashboard {
     // Why the queue stopped, with the one click that starts it again. Shown
     // beside the idle status row, or under a busy one — a pause the user
     // cannot see is a queue that looks broken.
-    fn queue_paused_notice(&self, error: String, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn queue_paused_notice(
+        &self,
+        error: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         div()
             .flex_1()
             .min_w_0()
@@ -1627,12 +1886,7 @@ impl Dashboard {
                     })
                     .when(!has_work, |row| {
                         row.child({
-                            let left = div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .gap_2();
+                            let left = div().flex_1().min_w_0().flex().items_center().gap_2();
                             if let Some(error) = self.queue_paused.clone() {
                                 left.child(self.queue_paused_notice(error, cx))
                             } else if can_run_next {
@@ -1649,21 +1903,26 @@ impl Dashboard {
                                         .text_color(theme::background())
                                         .cursor_pointer()
                                         .hover(|style| style.bg(theme::accent()))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.launch_next_queued(cx)
-                                        }))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.launch_next_queued(cx)
+                                            }),
+                                        )
                                         .child("Run next"),
                                 )
-                                .when_some(next_title, |row, title| {
-                                    row.child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_xs()
-                                            .text_color(theme::muted())
-                                            .child(title),
-                                    )
-                                })
+                                .when_some(
+                                    next_title,
+                                    |row, title| {
+                                        row.child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(theme::muted())
+                                                .child(title),
+                                        )
+                                    },
+                                )
                             } else {
                                 left.child(
                                     div()
@@ -1722,11 +1981,9 @@ impl Dashboard {
                                 .flex_col()
                                 .max_h(px(180.))
                                 .overflow_y_scroll()
-                                .children(self.queue.iter().enumerate().map(
-                                    |(index, entry)| {
-                                        self.queue_row(index, entry, next_id.as_deref(), cx)
-                                    },
-                                ))
+                                .children(self.queue.iter().enumerate().map(|(index, entry)| {
+                                    self.queue_row(index, entry, next_id.as_deref(), cx)
+                                }))
                                 .child(
                                     div()
                                         .id("queue-append")
@@ -1744,6 +2001,114 @@ impl Dashboard {
                         ),
                 )
             })
+    }
+
+    fn close_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let id = self.close_dialog_for.clone().unwrap_or_default();
+        let has_reason = !self.close_reason.is_empty();
+        div()
+            .id("close-dialog-backdrop")
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.55))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_close(cx)))
+            .child(
+                div()
+                    .id("close-dialog")
+                    .w(px(440.))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .rounded_lg()
+                    .bg(theme::surface())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow_lg()
+                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.stop_propagation()))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(format!("Close {id}?")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child("Optionally record why this bead is being closed."),
+                    )
+                    .child(
+                        div()
+                            .id("close-reason")
+                            .h(px(38.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .bg(theme::background())
+                            .border_1()
+                            .border_color(theme::accent().opacity(0.55))
+                            .cursor_text()
+                            .text_sm()
+                            .text_color(if has_reason {
+                                theme::text()
+                            } else {
+                                theme::muted()
+                            })
+                            .child(if has_reason {
+                                format!("{}|", self.close_reason)
+                            } else {
+                                "Close reason (optional)…|".to_owned()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("cancel-close")
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::surface_hover()))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.cancel_close(cx)
+                                    }))
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-close")
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(theme::danger().opacity(0.16))
+                                    .border_1()
+                                    .border_color(theme::danger().opacity(0.4))
+                                    .text_xs()
+                                    .text_color(theme::danger())
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::danger().opacity(0.25)))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.confirm_close(cx)
+                                    }))
+                                    .child("Close bead"),
+                            ),
+                    ),
+            )
     }
 
     fn completion_toast(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1993,7 +2358,13 @@ impl Dashboard {
                                 "Claude · Opus 5",
                                 cx,
                             ))
-                            .child(self.queue_option(&issue.id, AgentKind::Pi, None, "Pi", cx))
+                            .child(self.queue_option(
+                                &issue.id,
+                                AgentKind::Pi,
+                                None,
+                                "Pi",
+                                cx,
+                            ))
                         }),
                 ),
         )
@@ -2029,9 +2400,7 @@ impl Dashboard {
             .when(known, |row| {
                 row.cursor_pointer()
                     .hover(|style| style.bg(theme::surface_hover()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select(select_id.clone(), cx)
-                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select(select_id.clone(), cx)))
             })
             .child(
                 div()
@@ -2052,7 +2421,11 @@ impl Dashboard {
                 div()
                     .flex_none()
                     .text_xs()
-                    .text_color(if known { theme::accent() } else { theme::muted() })
+                    .text_color(if known {
+                        theme::accent()
+                    } else {
+                        theme::muted()
+                    })
                     .child(node.id.clone()),
             )
             .when_some(issue, |row, issue| {
@@ -2070,7 +2443,11 @@ impl Dashboard {
                         .min_w_0()
                         .truncate()
                         .text_xs()
-                        .text_color(if closed { theme::muted() } else { theme::text() })
+                        .text_color(if closed {
+                            theme::muted()
+                        } else {
+                            theme::text()
+                        })
                         .child(issue.title.clone()),
                 )
             })
@@ -2094,7 +2471,11 @@ impl Dashboard {
 
     // What is holding this bead up, as a tree: direct blockers at the root,
     // their blockers nested below.
-    fn blocked_by_section(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn blocked_by_section(
+        &self,
+        issue: &Issue,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let nodes = self.data.blocked_by_tree(&issue.id);
         self.dependency_tree_section("BLOCKED BY", "blocked-by", &nodes, cx)
     }
@@ -2246,7 +2627,7 @@ impl Dashboard {
                                     .items_center()
                                     .gap_2()
                                     .child(self.priority_pill_editable(issue, cx))
-                                    .child(self.state_badge(self.data.state(&issue.id)))
+                                    .child(self.state_badge_editable(issue, "inspector", cx))
                                     .when_some(
                                         queue::position(&self.queue, &issue.id),
                                         |row, index| row.child(self.queued_badge(index)),
@@ -2538,8 +2919,7 @@ impl Render for Dashboard {
             })
             .collect();
         let show_ungrouped = self.data.ungrouped.iter().any(|issue| {
-            self.issue_matches_filter(issue)
-                && (query.is_empty() || issue_matches(issue, &query))
+            self.issue_matches_filter(issue) && (query.is_empty() || issue_matches(issue, &query))
         });
         let mut closed_issues: Vec<_> = self
             .data
@@ -2743,6 +3123,7 @@ impl Render for Dashboard {
                             .flex_1()
                             .overflow_y_scroll()
                             .track_scroll(&self.dashboard_scroll)
+                            .on_scroll_wheel(cx.listener(Self::dashboard_scroll_wheel))
                             .p_3()
                             .child(
                                 div()
@@ -2800,6 +3181,9 @@ impl Render for Dashboard {
             })
             .when(!self.completed_toast.is_empty(), |root| {
                 root.child(self.completion_toast(cx))
+            })
+            .when(self.close_dialog_for.is_some(), |root| {
+                root.child(self.close_dialog(cx))
             })
     }
 }

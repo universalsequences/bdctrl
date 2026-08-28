@@ -19,6 +19,7 @@ With no path, the current directory is used.
 - Ready, blocked, in-progress, and closed totals
 - Click any bead or epic to inspect it
 - Click a `P0`–`P4` pill to advance its priority
+- Use a bead's status badge to set it open, in progress, or closed; closing can record an optional reason
 - Move a bead between epics from the inspector
 - Launch Pi or Claude agents through Herdr from the inspector
 - Hover working beads for a live agent-output preview; use `•••` to focus the agent

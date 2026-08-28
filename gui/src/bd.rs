@@ -29,6 +29,21 @@ impl BdClient {
         self.run(["priority", id, &priority.to_string()]).map(drop)
     }
 
+    pub fn set_status(&self, id: &str, status: &str) -> Result<()> {
+        self.run(["update", id, "--status", status]).map(drop)
+    }
+
+    pub fn close(&self, id: &str, reason: Option<&str>) -> Result<()> {
+        match reason.filter(|reason| !reason.trim().is_empty()) {
+            Some(reason) => self.run(["close", id, "--reason", reason]).map(drop),
+            None => self.run(["close", id]).map(drop),
+        }
+    }
+
+    pub fn reopen(&self, id: &str) -> Result<()> {
+        self.run(["reopen", id]).map(drop)
+    }
+
     pub fn set_parent(&self, id: &str, parent: Option<&str>) -> Result<()> {
         self.run(["update", id, "--parent", parent.unwrap_or("")])
             .map(drop)
