@@ -5,6 +5,7 @@ mod dashboard;
 mod herdr;
 mod model;
 mod queue;
+mod terminal;
 mod theme;
 
 use std::{env, path::PathBuf};

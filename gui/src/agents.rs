@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime},
+    time::SystemTime,
 };
 
 use crate::{
@@ -11,11 +11,6 @@ use crate::{
     model::DashboardData,
 };
 
-// Scraping a pane shells out to herdr, so an unattributed tab is only read
-// this often rather than on every refresh tick.
-const SCRAPE_EVERY: Duration = Duration::from_secs(10);
-// Terminal lines searched for a claim: a few screens of scrollback.
-const SCRAPE_LINES: u32 = 400;
 // How far a transcript's creation may sit from its process's start before we
 // stop believing they belong together.
 const START_SKEW: u64 = 120;
@@ -23,23 +18,23 @@ const START_SKEW: u64 = 120;
 const AMBIGUOUS: u64 = 10;
 
 // Which agent is on which bead. Launched agents are known by the name we gave
-// them; tabs somebody opened by hand have to be attributed from what they did
-// — the claim in their transcript, or failing that the text on their screen.
+// them; tabs somebody opened by hand are attributed from the claim in their
+// transcript. Reading a pane's screen would work too, but `herdr agent read`
+// disturbs the pane's viewport, so we never scrape as a fallback.
 #[derive(Default)]
 pub struct AgentScan {
     sessions: SessionIndex,
-    scrapes: HashMap<String, (Instant, Option<String>)>,
 }
 
 impl AgentScan {
     pub fn run(&mut self, data: &DashboardData, project: &Path) -> HashMap<String, AgentInfo> {
         let mut discovery = herdr::discover_agents(&data.issues, project);
-        self.attribute(&mut discovery, data, project);
+        self.attribute(&mut discovery, data);
         claude::attach_context(&mut discovery.by_bead, project, &mut self.sessions);
         discovery.by_bead
     }
 
-    fn attribute(&mut self, discovery: &mut Discovery, data: &DashboardData, project: &Path) {
+    fn attribute(&mut self, discovery: &mut Discovery, data: &DashboardData) {
         let known: HashSet<&str> = data.issues.iter().map(|issue| issue.id.as_str()).collect();
         // Only claimed beads that no launched agent accounts for are up for
         // attribution — an in-progress bead with nobody on it is exactly what
@@ -57,8 +52,7 @@ impl AgentScan {
         }
 
         let transcripts = transcripts_for(&discovery.unclaimed);
-        let mut attributed = HashSet::new();
-        for (index, pane) in discovery.unclaimed.iter().enumerate() {
+        for pane in &discovery.unclaimed {
             let Some(path) = transcripts.get(&pane.target) else {
                 continue;
             };
@@ -71,49 +65,7 @@ impl AgentScan {
             let mut info = pane.info(true);
             info.context_tokens = claude::context_tokens(path);
             discovery.by_bead.insert(bead, info);
-            attributed.insert(index);
         }
-
-        // Whatever is left — a pi tab, a resumed session, a transcript we
-        // could not pin to a pane — falls back to reading the screen.
-        for (index, pane) in discovery.unclaimed.iter().enumerate() {
-            if wanted.is_empty() {
-                break;
-            }
-            if attributed.contains(&index) {
-                continue;
-            }
-            let Some(bead) = self.scrape(pane, &wanted, project) else {
-                continue;
-            };
-            wanted.remove(bead.as_str());
-            discovery.by_bead.insert(bead, pane.info(true));
-        }
-    }
-
-    fn scrape(
-        &mut self,
-        pane: &PaneAgent,
-        wanted: &HashSet<&str>,
-        project: &Path,
-    ) -> Option<String> {
-        let fresh = self
-            .scrapes
-            .get(&pane.target)
-            .filter(|(read_at, _)| read_at.elapsed() < SCRAPE_EVERY);
-        let bead = match fresh {
-            Some((_, bead)) => bead.clone(),
-            None => {
-                let bead = herdr::read_agent_text(&pane.target, project, SCRAPE_LINES)
-                    .ok()
-                    .and_then(|text| bead_in_text(&text, wanted));
-                self.scrapes
-                    .insert(pane.target.clone(), (Instant::now(), bead.clone()));
-                bead
-            }
-        };
-        // A cached answer was matched against an older set of open claims.
-        bead.filter(|bead| wanted.contains(bead.as_str()))
     }
 }
 
@@ -246,65 +198,3 @@ fn pane_processes() -> Vec<PaneProcess> {
         .collect()
 }
 
-// The bead a terminal is most likely on: the last one mentioned, with a line
-// that ran `--claim` outranking a line that only talks about it.
-fn bead_in_text(text: &str, wanted: &HashSet<&str>) -> Option<String> {
-    let mut best: Option<((bool, usize, usize), &str)> = None;
-    for (number, line) in text.lines().enumerate() {
-        let claim = line.contains("--claim");
-        for bead in wanted {
-            if !mentions(line, bead) {
-                continue;
-            }
-            // Length breaks ties so `bd-3.1` wins over the `bd-3` inside it.
-            let rank = (claim, number, bead.len());
-            if best.is_none_or(|(current, _)| current < rank) {
-                best = Some((rank, bead));
-            }
-        }
-    }
-    best.map(|(_, bead)| bead.to_owned())
-}
-
-fn mentions(line: &str, bead: &str) -> bool {
-    line.match_indices(bead).any(|(index, _)| {
-        let before = line[..index].chars().next_back();
-        let after = line[index + bead.len()..].chars().next();
-        !before.is_some_and(is_id_character) && !after.is_some_and(is_id_character)
-    })
-}
-
-fn is_id_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || "._-".contains(character)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn picks_the_bead_a_terminal_last_claimed() {
-        let wanted = HashSet::from(["bd-3", "bd-3.1", "bd-7"]);
-        let text = "\
-> bd show bd-7
-  working on bd-7 for a while
-> bd update bd-3.1 --claim
-  claimed";
-        assert_eq!(bead_in_text(text, &wanted).as_deref(), Some("bd-3.1"));
-
-        // With no claim on screen, the last mention wins.
-        let mentions_only = "bd show bd-7\nlater talk about bd-3\n";
-        assert_eq!(bead_in_text(mentions_only, &wanted).as_deref(), Some("bd-3"));
-
-        // bd-3 inside bd-3.1 is not a mention of bd-3.
-        assert_eq!(bead_in_text("bd-3.1 only", &wanted).as_deref(), Some("bd-3.1"));
-        assert_eq!(bead_in_text("nothing here", &wanted), None);
-    }
-
-    #[test]
-    fn bead_ids_match_only_as_whole_ids() {
-        assert!(mentions("ran bd-7 today", "bd-7"));
-        assert!(!mentions("prefix-bd-7", "bd-7"));
-        assert!(!mentions("bd-7.2", "bd-7"));
-    }
-}

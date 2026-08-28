@@ -36,6 +36,12 @@ pub struct Issue {
     pub updated_at: Option<String>,
 }
 
+impl Issue {
+    pub fn starred(&self) -> bool {
+        self.labels.iter().any(|label| label == "starred")
+    }
+}
+
 fn untitled() -> String {
     "Untitled".into()
 }
@@ -72,6 +78,23 @@ impl EpicSummary {
         } else {
             self.closed as f32 / self.children.len() as f32
         }
+    }
+
+    // Epics normally remain open after their work is done. Completion is
+    // therefore derived from the child beads rather than the epic's status.
+    pub fn is_complete(&self) -> bool {
+        !self.children.is_empty() && self.closed == self.children.len()
+    }
+
+    // The epic completed when its last child closed. Beads exports use
+    // sortable ISO timestamps, so a lexical maximum gives us that event time.
+    pub fn completed_at(&self) -> Option<&str> {
+        self.is_complete().then(|| {
+            self.children
+                .iter()
+                .filter_map(|child| child.closed_at.as_deref().or(child.updated_at.as_deref()))
+                .max()
+        })?
     }
 }
 
@@ -234,9 +257,11 @@ impl DashboardData {
                 }
             })
             .collect();
+        // Starred epics lead the grid so the current focus is always top-left.
         epics.sort_by_key(|summary| {
             (
                 summary.epic.status == "closed",
+                !summary.epic.starred(),
                 summary.epic.priority,
                 summary.epic.title.to_lowercase(),
             )
@@ -398,6 +423,53 @@ mod tests {
         assert_eq!(data.epics[0].closed, 1);
         assert_eq!(data.state("b"), WorkState::Ready);
         assert_eq!(data.ungrouped[0].id, "c");
+    }
+
+    #[test]
+    fn derives_open_epic_completion_from_its_children() {
+        let raw = r#"
+{"id":"e","title":"Still open","status":"open","priority":1,"issue_type":"epic"}
+{"id":"a","title":"First","status":"closed","priority":2,"issue_type":"task","closed_at":"2025-01-02T10:00:00Z","dependencies":[{"issue_id":"a","depends_on_id":"e","type":"parent-child"}]}
+{"id":"b","title":"Last","status":"closed","priority":2,"issue_type":"task","closed_at":"2025-01-03T12:30:00Z","dependencies":[{"issue_id":"b","depends_on_id":"e","type":"parent-child"}]}
+{"id":"empty","title":"Empty","status":"open","priority":2,"issue_type":"epic"}
+"#;
+        let data = DashboardData::from_export(raw).unwrap();
+        let complete = data
+            .epics
+            .iter()
+            .find(|summary| summary.epic.id == "e")
+            .unwrap();
+        let empty = data
+            .epics
+            .iter()
+            .find(|summary| summary.epic.id == "empty")
+            .unwrap();
+
+        assert!(complete.is_complete());
+        assert_eq!(complete.completed_at(), Some("2025-01-03T12:30:00Z"));
+        assert!(
+            !empty.is_complete(),
+            "an empty epic has not had a completion event"
+        );
+    }
+
+    #[test]
+    fn starred_epics_sort_first_but_never_above_open_work() {
+        let raw = r#"
+{"id":"p0","title":"Urgent","status":"open","priority":0,"issue_type":"epic"}
+{"id":"fav","title":"Zebra focus","status":"open","priority":2,"issue_type":"epic","labels":["starred"]}
+{"id":"done","title":"Done","status":"closed","priority":0,"issue_type":"epic","labels":["starred"]}
+"#;
+        let data = DashboardData::from_export(raw).unwrap();
+        let order: Vec<_> = data
+            .epics
+            .iter()
+            .map(|summary| summary.epic.id.as_str())
+            .collect();
+        // Starred beats priority among open epics; closed sinks regardless.
+        assert_eq!(order, vec!["fav", "p0", "done"]);
+        assert!(data.issue("fav").unwrap().starred());
+        assert!(!data.issue("p0").unwrap().starred());
     }
 
     #[test]

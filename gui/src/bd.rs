@@ -49,6 +49,20 @@ impl BdClient {
             .map(drop)
     }
 
+    pub fn set_description(&self, id: &str, description: &str) -> Result<()> {
+        self.run(["update", id, "--description", description])
+            .map(drop)
+    }
+
+    pub fn set_starred(&self, id: &str, starred: bool) -> Result<()> {
+        let flag = if starred {
+            "--add-label"
+        } else {
+            "--remove-label"
+        };
+        self.run(["update", id, flag, "starred"]).map(drop)
+    }
+
     fn run<const N: usize>(&self, args: [&str; N]) -> Result<String> {
         let output = Command::new("bd")
             .args(args)

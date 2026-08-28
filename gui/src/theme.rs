@@ -189,6 +189,9 @@ pub fn progress() -> Hsla {
 pub fn danger() -> Hsla {
     color(|palette| palette.danger)
 }
+pub fn star() -> Hsla {
+    rgb(0xf2c94c).into()
+}
 
 pub fn priority(priority: u8) -> Hsla {
     color(|palette| palette.priorities[usize::from(priority.min(4))])

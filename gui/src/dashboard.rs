@@ -5,11 +5,12 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, ClickEvent, Context, Corner, Div, FocusHandle, Focusable, Hsla, IntoElement,
-    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Render, ScrollAnchor, ScrollHandle, ScrollWheelEvent, SharedString,
-    Stateful, Styled, Window, WindowBounds, WindowOptions, actions, anchored, deferred, div, point,
-    prelude::*, px, relative, size,
+    App, Bounds, ClickEvent, ClipboardItem, Context, Corner, Div, Entity, FocusHandle, Focusable,
+    HighlightStyle, Hsla, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollAnchor, ScrollHandle,
+    ScrollWheelEvent, SharedString, Stateful, Styled, StyledText, Window, WindowBounds,
+    WindowOptions, actions, anchored, canvas, deferred, div, fill, point, prelude::*, px, relative,
+    size,
 };
 
 use crate::{
@@ -18,6 +19,7 @@ use crate::{
     herdr::{self, AgentInfo, AgentKind},
     model::{BlocksNode, DashboardData, EpicSummary, Issue, WorkState},
     queue::{self, QueueEntry},
+    terminal::ChatTerminal,
     theme,
 };
 
@@ -30,6 +32,32 @@ enum DashboardFilter {
     Ready,
     Working,
     Closed,
+}
+
+#[derive(Clone, Copy)]
+enum ClosedEvent<'a> {
+    Issue(&'a Issue),
+    EpicCompleted(&'a EpicSummary),
+}
+
+impl<'a> ClosedEvent<'a> {
+    fn issue(self) -> &'a Issue {
+        match self {
+            Self::Issue(issue) => issue,
+            Self::EpicCompleted(summary) => &summary.epic,
+        }
+    }
+
+    fn timestamp(self) -> &'a str {
+        match self {
+            Self::Issue(issue) => closure_time(issue),
+            Self::EpicCompleted(summary) => summary.completed_at().unwrap_or(""),
+        }
+    }
+
+    fn is_epic_completion(self) -> bool {
+        matches!(self, Self::EpicCompleted(_))
+    }
 }
 
 pub struct Dashboard {
@@ -46,6 +74,8 @@ pub struct Dashboard {
     search_open: bool,
     search_query: String,
     filter: DashboardFilter,
+    starred_only: bool,
+    desc_edit: Option<DescEdit>,
     agent_menu_for: Option<String>,
     priority_menu_for: Option<String>,
     state_menu_for: Option<String>,
@@ -67,6 +97,193 @@ pub struct Dashboard {
     // Beads we launched an agent for that has not yet run `bd update --claim`,
     // keyed by bead id. See queue::Claim.
     optimistic_claims: HashMap<String, queue::Claim>,
+    // Right-clicked row in the closed view, showing its context menu.
+    closed_menu_for: Option<String>,
+    // Every embedded chat terminal started this session. Closing the pane
+    // hides it; the PTYs stay alive until a convo is explicitly killed.
+    chats: Vec<Entity<ChatTerminal>>,
+    active_chat: usize,
+    chat_open: bool,
+    // The convo-switcher dropdown under the pane header title.
+    chat_menu_open: bool,
+}
+
+// In-flight description edit. The buffer is detached from the issue so the
+// 2-second auto-refresh can swap `data` underneath without stomping typing.
+struct DescEdit {
+    id: String,
+    buffer: String,
+    // Byte offset into `buffer`, always on a char boundary.
+    cursor: usize,
+    // Selection anchor; a selection spans anchor..cursor in either direction.
+    anchor: Option<usize>,
+    // A mouse drag that started inside the editor is extending the selection.
+    dragging: bool,
+}
+
+impl DescEdit {
+    fn new(id: String, buffer: String) -> Self {
+        let cursor = buffer.len();
+        Self {
+            id,
+            buffer,
+            cursor,
+            anchor: None,
+            dragging: false,
+        }
+    }
+
+    fn selection(&self) -> Option<std::ops::Range<usize>> {
+        let anchor = self.anchor.filter(|anchor| *anchor != self.cursor)?;
+        Some(anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.selection().map(|range| self.buffer[range].to_owned())
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some(range) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        self.cursor = range.start;
+        self.buffer.replace_range(range, "");
+        self.anchor = None;
+        true
+    }
+
+    fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.buffer.len();
+    }
+
+    // Called before every cursor motion: shift extends the selection from
+    // where the cursor was, plain motion drops it.
+    fn begin_move(&mut self, extend: bool) {
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
+            }
+        } else {
+            self.anchor = None;
+        }
+    }
+
+    fn set_cursor(&mut self, index: usize, extend: bool) {
+        let mut index = index.min(self.buffer.len());
+        while !self.buffer.is_char_boundary(index) {
+            index -= 1;
+        }
+        self.begin_move(extend);
+        self.cursor = index;
+    }
+
+    fn insert(&mut self, text: &str) {
+        self.delete_selection();
+        self.buffer.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if let Some(previous) = self.buffer[..self.cursor].chars().next_back() {
+            self.cursor -= previous.len_utf8();
+            self.buffer.remove(self.cursor);
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor < self.buffer.len() {
+            self.buffer.remove(self.cursor);
+        }
+    }
+
+    fn move_left(&mut self) {
+        if let Some(range) = self.selection() {
+            self.cursor = range.start;
+            self.anchor = None;
+            return;
+        }
+        self.anchor = None;
+        if let Some(previous) = self.buffer[..self.cursor].chars().next_back() {
+            self.cursor -= previous.len_utf8();
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(range) = self.selection() {
+            self.cursor = range.end;
+            self.anchor = None;
+            return;
+        }
+        self.anchor = None;
+        if let Some(next) = self.buffer[self.cursor..].chars().next() {
+            self.cursor += next.len_utf8();
+        }
+    }
+
+    fn extend_left(&mut self) {
+        self.begin_move(true);
+        if let Some(previous) = self.buffer[..self.cursor].chars().next_back() {
+            self.cursor -= previous.len_utf8();
+        }
+    }
+
+    fn extend_right(&mut self) {
+        self.begin_move(true);
+        if let Some(next) = self.buffer[self.cursor..].chars().next() {
+            self.cursor += next.len_utf8();
+        }
+    }
+
+    fn line_start(&self) -> usize {
+        self.buffer[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1)
+    }
+
+    fn line_end(&self) -> usize {
+        self.buffer[self.cursor..]
+            .find('\n')
+            .map_or(self.buffer.len(), |index| self.cursor + index)
+    }
+
+    fn move_vertical(&mut self, up: bool) {
+        let column = self.buffer[self.line_start()..self.cursor].chars().count();
+        let start = self.line_start();
+        let target_start = if up {
+            if start == 0 {
+                self.cursor = 0;
+                return;
+            }
+            self.buffer[..start - 1]
+                .rfind('\n')
+                .map_or(0, |index| index + 1)
+        } else {
+            let end = self.line_end();
+            if end == self.buffer.len() {
+                self.cursor = end;
+                return;
+            }
+            end + 1
+        };
+        let target_line = &self.buffer[target_start..];
+        let target_len = target_line.find('\n').unwrap_or(target_line.len());
+        let mut offset = 0;
+        for character in self.buffer[target_start..target_start + target_len]
+            .chars()
+            .take(column)
+        {
+            offset += character.len_utf8();
+        }
+        self.cursor = target_start + offset;
+    }
 }
 
 #[derive(Clone)]
@@ -138,6 +355,8 @@ impl Dashboard {
             search_open: false,
             search_query: String::new(),
             filter: DashboardFilter::All,
+            starred_only: false,
+            desc_edit: None,
             agent_menu_for: None,
             priority_menu_for: None,
             state_menu_for: None,
@@ -157,6 +376,11 @@ impl Dashboard {
             queue_paused: None,
             queue_launching: None,
             optimistic_claims: HashMap::new(),
+            closed_menu_for: None,
+            chats: Vec::new(),
+            active_chat: 0,
+            chat_open: false,
+            chat_menu_open: false,
         }
     }
 
@@ -370,6 +594,9 @@ impl Dashboard {
     }
 
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if self.desc_edit.is_some() {
+            return;
+        }
         self.search_open = true;
         window.focus(&self.focus_handle);
         cx.notify();
@@ -387,6 +614,120 @@ impl Dashboard {
         self.search_open = false;
         self.dashboard_scroll
             .set_offset(gpui::point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    fn start_desc_edit(&mut self, issue: &Issue, window: &mut Window, cx: &mut Context<Self>) {
+        self.desc_edit = Some(DescEdit::new(issue.id.clone(), issue.description.clone()));
+        self.search_open = false;
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn cancel_desc_edit(&mut self, cx: &mut Context<Self>) {
+        self.desc_edit = None;
+        cx.notify();
+    }
+
+    fn save_desc_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.desc_edit.take() else {
+            return;
+        };
+        if let Err(error) = self.bd.set_description(&edit.id, &edit.buffer) {
+            self.message = Some(error.to_string());
+            self.desc_edit = Some(edit);
+        } else {
+            self.reload(cx);
+            self.selected = Some(edit.id);
+        }
+        cx.notify();
+    }
+
+    fn desc_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.desc_edit.is_none() {
+            return;
+        }
+        let modifiers = event.keystroke.modifiers;
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                self.cancel_desc_edit(cx);
+                cx.stop_propagation();
+                return;
+            }
+            "enter" if modifiers.platform => {
+                self.save_desc_edit(cx);
+                cx.stop_propagation();
+                return;
+            }
+            _ => {}
+        }
+        let Some(edit) = self.desc_edit.as_mut() else {
+            return;
+        };
+        match event.keystroke.key.as_str() {
+            "enter" => edit.insert("\n"),
+            "backspace" => edit.backspace(),
+            "delete" => edit.delete(),
+            "left" if modifiers.platform => {
+                edit.begin_move(modifiers.shift);
+                edit.cursor = edit.line_start();
+            }
+            "right" if modifiers.platform => {
+                edit.begin_move(modifiers.shift);
+                edit.cursor = edit.line_end();
+            }
+            "left" if modifiers.shift => edit.extend_left(),
+            "right" if modifiers.shift => edit.extend_right(),
+            "left" => edit.move_left(),
+            "right" => edit.move_right(),
+            "up" => {
+                edit.begin_move(modifiers.shift);
+                edit.move_vertical(true);
+            }
+            "down" => {
+                edit.begin_move(modifiers.shift);
+                edit.move_vertical(false);
+            }
+            "home" => {
+                edit.begin_move(modifiers.shift);
+                edit.cursor = edit.line_start();
+            }
+            "end" => {
+                edit.begin_move(modifiers.shift);
+                edit.cursor = edit.line_end();
+            }
+            "a" if modifiers.platform => edit.select_all(),
+            "c" if modifiers.platform => {
+                if let Some(text) = edit.selected_text() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                // Nothing changed on screen; skip the notify below.
+                cx.stop_propagation();
+                return;
+            }
+            "x" if modifiers.platform => {
+                if let Some(text) = edit.selected_text() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    edit.delete_selection();
+                }
+            }
+            "v" if modifiers.platform => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    edit.insert(&text);
+                }
+            }
+            _ if !modifiers.control && !modifiers.alt && !modifiers.platform => {
+                let Some(text) = event.keystroke.key_char.clone() else {
+                    return;
+                };
+                if text.chars().any(|character| character.is_control()) {
+                    return;
+                }
+                edit.insert(&text);
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -413,6 +754,10 @@ impl Dashboard {
                 _ => return,
             }
             cx.stop_propagation();
+            return;
+        }
+        if self.desc_edit.is_some() {
+            self.desc_key_down(event, cx);
             return;
         }
         if !self.search_open {
@@ -446,6 +791,13 @@ impl Dashboard {
     }
 
     fn select(&mut self, id: String, cx: &mut Context<Self>) {
+        if self
+            .desc_edit
+            .as_ref()
+            .is_some_and(|edit| edit.id != id)
+        {
+            self.desc_edit = None;
+        }
         self.selected = Some(id);
         cx.notify();
     }
@@ -453,6 +805,7 @@ impl Dashboard {
     fn dismiss_inspector(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.selected = None;
         self.inspector_resize = None;
+        self.desc_edit = None;
         cx.notify();
     }
 
@@ -563,6 +916,26 @@ impl Dashboard {
         cx.notify();
     }
 
+    fn toggle_star(&mut self, id: String, starred: bool, cx: &mut Context<Self>) {
+        if let Err(error) = self.bd.set_starred(&id, !starred) {
+            self.message = Some(error.to_string());
+        } else {
+            self.reload(cx);
+            // Unstarring the last starred epic would leave the filter showing
+            // nothing — drop back to the full grid instead.
+            if self.starred_only
+                && !self
+                    .data
+                    .epics
+                    .iter()
+                    .any(|summary| summary.epic.starred() && summary.epic.status != "closed")
+            {
+                self.starred_only = false;
+            }
+        }
+        cx.notify();
+    }
+
     fn cancel_close(&mut self, cx: &mut Context<Self>) {
         self.close_dialog_for = None;
         self.close_reason.clear();
@@ -581,6 +954,13 @@ impl Dashboard {
             self.selected = Some(id);
         }
         self.close_reason.clear();
+        cx.notify();
+    }
+
+    fn toggle_starred_only(&mut self, cx: &mut Context<Self>) {
+        self.starred_only = !self.starred_only;
+        self.dashboard_scroll
+            .set_offset(gpui::point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -867,6 +1247,355 @@ impl Dashboard {
         .detach();
     }
 
+    fn chat_labelled(&self, label: &str, cx: &App) -> Option<usize> {
+        self.chats
+            .iter()
+            .position(|chat| chat.read(cx).label == label)
+    }
+
+    fn activate_chat(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_chat = index;
+        self.chat_open = true;
+        self.chat_menu_open = false;
+        if let Some(chat) = self.chats.get(index) {
+            let focus = chat.read(cx).focus_handle(cx);
+            window.focus(&focus);
+        }
+        cx.notify();
+    }
+
+    fn chat_about(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.closed_menu_for = None;
+        // One conversation per bead: a second "chat about it" resumes it.
+        if let Some(index) = self.chat_labelled(&id, cx) {
+            self.activate_chat(index, window, cx);
+            return;
+        }
+        let Some(issue) = self.data.issue(&id).cloned() else {
+            return;
+        };
+        match ChatTerminal::open(&issue, self.bd.project(), cx) {
+            Ok(chat) => {
+                self.chats.push(chat);
+                self.activate_chat(self.chats.len() - 1, window, cx);
+            }
+            Err(error) => {
+                self.message = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn open_designer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.chat_labelled("designer", cx) {
+            self.activate_chat(index, window, cx);
+            return;
+        }
+        match ChatTerminal::open_designer(self.bd.project(), cx) {
+            Ok(chat) => {
+                self.chats.push(chat);
+                self.activate_chat(self.chats.len() - 1, window, cx);
+            }
+            Err(error) => {
+                self.message = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    // × on the pane hides it; every conversation stays alive for the session.
+    fn close_chat(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        self.chat_open = false;
+        self.chat_menu_open = false;
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    // Dropping the entity shuts its PTY event loop down via ChatTerminal's
+    // Drop — this is the one gesture that actually ends a conversation.
+    fn kill_chat(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.chats.len() {
+            return;
+        }
+        self.chats.remove(index);
+        if self.chats.is_empty() {
+            self.chat_open = false;
+            self.chat_menu_open = false;
+            window.focus(&self.focus_handle);
+        } else if self.active_chat >= self.chats.len() {
+            self.active_chat = self.chats.len() - 1;
+        } else if index < self.active_chat {
+            self.active_chat -= 1;
+        }
+        cx.notify();
+    }
+
+    fn close_closed_menu(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.closed_menu_for = None;
+        cx.notify();
+    }
+
+    fn closed_row_menu(&self, issue_id: &str, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let id = issue_id.to_owned();
+        deferred(
+            anchored()
+                .anchor(Corner::TopLeft)
+                .offset(point(px(0.), px(24.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(
+                    div()
+                        .occlude()
+                        .w(px(240.))
+                        .rounded_lg()
+                        .bg(theme::background())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .on_mouse_down_out(cx.listener(Self::close_closed_menu))
+                        .child(
+                            div()
+                                .id("chat-about-bead")
+                                .px_3()
+                                .py_2()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::surface_hover()))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.chat_about(id.clone(), window, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme::text())
+                                        .child("Chat about it"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child("Claude · Fable, right here in a quick terminal"),
+                                ),
+                        ),
+                ),
+        )
+        .with_priority(2)
+    }
+
+    // The docked chat pane: header identifying the bead, the terminal view
+    // underneath. A side pane on wide windows; on narrow ones a bottom pane
+    // under the inspector and deck, mirroring the inspector's docking rule.
+    // The dropdown under the pane title: every live conversation, with a
+    // kill button per row, plus the designer entry point.
+    fn chat_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let has_designer = self.chat_labelled("designer", cx).is_some();
+        let rows: Vec<_> = self
+            .chats
+            .iter()
+            .enumerate()
+            .map(|(index, chat)| {
+                let chat = chat.read(cx);
+                (index, chat.label.clone(), chat.subtitle.clone(), chat.exited())
+            })
+            .collect();
+        deferred(
+            anchored()
+                .anchor(Corner::TopLeft)
+                .offset(point(px(0.), px(30.)))
+                .snap_to_window_with_margin(px(8.))
+                .child(
+                    div()
+                        .occlude()
+                        .w(px(300.))
+                        .rounded_lg()
+                        .bg(theme::background())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.chat_menu_open = false;
+                            cx.notify();
+                        }))
+                        .children(rows.into_iter().map(|(index, label, subtitle, exited)| {
+                            let active = index == self.active_chat;
+                            div()
+                                .id(SharedString::from(format!("chat-switch:{index}")))
+                                .px_3()
+                                .py_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .when(active, |row| row.bg(theme::surface()))
+                                .hover(|style| style.bg(theme::surface_hover()))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.activate_chat(index, window, cx);
+                                }))
+                                .child(div().size(px(6.)).rounded_full().bg(if exited {
+                                    theme::muted()
+                                } else {
+                                    theme::accent()
+                                }))
+                                .child(div().text_sm().text_color(theme::text()).child(label))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child(subtitle),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("chat-kill:{index}")))
+                                        .px_1()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .cursor_pointer()
+                                        .hover(|style| {
+                                            style
+                                                .bg(theme::raised_hover())
+                                                .text_color(theme::danger())
+                                        })
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.kill_chat(index, window, cx);
+                                        }))
+                                        .child("×"),
+                                )
+                        }))
+                        .when(!has_designer, |menu| {
+                            menu.child(
+                                div()
+                                    .id("chat-switch-designer")
+                                    .px_3()
+                                    .py_2()
+                                    .border_t_1()
+                                    .border_color(theme::border())
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::surface_hover()))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.chat_menu_open = false;
+                                        this.open_designer(window, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme::text())
+                                            .child("✎ New designer chat"),
+                                    ),
+                            )
+                        }),
+                ),
+        )
+        .with_priority(3)
+    }
+
+    fn chat_panel(
+        &self,
+        chat: Entity<ChatTerminal>,
+        bottom: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let (label, subtitle, exited) = {
+            let chat = chat.read(cx);
+            (chat.label.clone(), chat.subtitle.clone(), chat.exited())
+        };
+        div()
+            .flex()
+            .flex_col()
+            .bg(theme::background())
+            .when(bottom, |pane| {
+                pane.w_full()
+                    .h(px(300.))
+                    .max_h(relative(0.45))
+                    .border_t_1()
+            })
+            .when(!bottom, |pane| {
+                pane.w(px(600.)).min_w(px(420.)).h_full().border_l_1()
+            })
+            .border_color(theme::border())
+            .child(
+                div()
+                    // Matches the 46px toolbar so the two header rows line up
+                    // across the pane border.
+                    .h(px(46.))
+                    .flex_none()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .child(div().size(px(7.)).rounded_full().bg(if exited {
+                        theme::muted()
+                    } else {
+                        theme::accent()
+                    }))
+                    .child(
+                        div()
+                            .id("chat-title")
+                            .px_1()
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::surface_hover()))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.chat_menu_open = !this.chat_menu_open;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child(format!("Chat · {label}")),
+                            )
+                            .child(div().text_xs().text_color(theme::muted()).child("▾"))
+                            .when(self.chat_menu_open, |title| {
+                                title.child(self.chat_switcher(cx))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(subtitle),
+                    )
+                    .child(self.badge("FABLE", theme::accent()))
+                    .child(
+                        div()
+                            .id("close-chat")
+                            .size(px(22.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .text_color(theme::muted())
+                            .cursor_pointer()
+                            .hover(|style| {
+                                style.bg(theme::surface_hover()).text_color(theme::text())
+                            })
+                            .on_click(cx.listener(Self::close_chat))
+                            .child("×"),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(chat))
+    }
+
     fn priority_pill_base(pill: Stateful<Div>, priority: u8) -> Stateful<Div> {
         pill.px_1()
             .rounded_sm()
@@ -1031,6 +1760,45 @@ impl Dashboard {
             .child(div().text_color(theme::muted()).child(label))
     }
 
+    // Header toggle that narrows the grid to starred epics only. Lives next
+    // to the state filters but is independent of them — both can be active.
+    fn starred_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let starred = self
+            .data
+            .epics
+            .iter()
+            .filter(|summary| summary.epic.starred() && summary.epic.status != "closed")
+            .count();
+        let selected = self.starred_only;
+        let color = theme::star();
+        div()
+            .id("filter:starred")
+            .px_2()
+            .py_1()
+            .flex()
+            .items_baseline()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(if selected {
+                color.opacity(0.45)
+            } else {
+                gpui::transparent_black()
+            })
+            .when(selected, |stat| stat.bg(color.opacity(0.12)))
+            .cursor_pointer()
+            .hover(|style| style.bg(color.opacity(0.1)))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_starred_only(cx)))
+            .text_xs()
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(if starred > 0 { color } else { theme::muted() })
+                    .child(format!("★ {starred}")),
+            )
+            .child(div().text_color(theme::muted()).child("starred"))
+    }
+
     fn state_badge(&self, state: WorkState) -> Div {
         let (label, color) = match state {
             WorkState::Ready => ("READY", theme::ready()),
@@ -1039,6 +1807,10 @@ impl Dashboard {
             WorkState::Closed => ("CLOSED", theme::muted()),
             WorkState::Other => ("OTHER", theme::muted()),
         };
+        self.badge(label, color)
+    }
+
+    fn badge(&self, label: &'static str, color: Hsla) -> Div {
         div()
             .px_1()
             .rounded_sm()
@@ -1198,6 +1970,219 @@ impl Dashboard {
             .child(self.state_badge_editable(issue, "row", cx))
     }
 
+    fn description_section(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let editing = self
+            .desc_edit
+            .as_ref()
+            .filter(|edit| edit.id == issue.id.as_str());
+        let issue_for_edit = issue.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_xs().text_color(theme::muted()).child("DESCRIPTION"))
+                    .when(editing.is_none(), |header| {
+                        header.child(
+                            div()
+                                .id(SharedString::from(format!("edit-desc:{}", issue.id)))
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(theme::text()))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.start_desc_edit(&issue_for_edit, window, cx);
+                                }))
+                                .child("✎"),
+                        )
+                    })
+                    .when(editing.is_some(), |header| {
+                        header.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted())
+                                .child("⌘⏎ save · esc cancel"),
+                        )
+                    }),
+            )
+            .map(|section| match editing {
+                Some(edit) => {
+                    let styled = StyledText::new(edit.buffer.clone()).with_highlights(
+                        edit.selection().map(|range| {
+                            (
+                                range,
+                                HighlightStyle {
+                                    background_color: Some(theme::accent().opacity(0.35)),
+                                    ..Default::default()
+                                },
+                            )
+                        }),
+                    );
+                    let layout = styled.layout().clone();
+                    let down_layout = layout.clone();
+                    let move_layout = layout.clone();
+                    let cursor = edit.cursor;
+                    section
+                        .child(
+                            div()
+                                .id("desc-editor")
+                                .p_2()
+                                .rounded_md()
+                                .bg(theme::background())
+                                .border_1()
+                                .border_color(theme::accent().opacity(0.5))
+                                .text_sm()
+                                .line_height(relative(1.45))
+                                .text_color(theme::text())
+                                .cursor_text()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        let Some(edit) = this.desc_edit.as_mut() else {
+                                            return;
+                                        };
+                                        let index = match down_layout.index_for_position(event.position)
+                                        {
+                                            Ok(index) | Err(index) => index,
+                                        };
+                                        edit.set_cursor(index, event.modifiers.shift);
+                                        if !event.modifiers.shift {
+                                            edit.anchor = Some(edit.cursor);
+                                        }
+                                        edit.dragging = true;
+                                        cx.notify();
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(
+                                    move |this, event: &MouseMoveEvent, _, cx| {
+                                        let Some(edit) = this.desc_edit.as_mut() else {
+                                            return;
+                                        };
+                                        if !edit.dragging {
+                                            return;
+                                        }
+                                        if !event.dragging() {
+                                            edit.dragging = false;
+                                            return;
+                                        }
+                                        let index = match move_layout.index_for_position(event.position)
+                                        {
+                                            Ok(index) | Err(index) => index,
+                                        };
+                                        edit.set_cursor(index, true);
+                                        cx.notify();
+                                    },
+                                ))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseUpEvent, _, _| {
+                                        if let Some(edit) = this.desc_edit.as_mut() {
+                                            edit.dragging = false;
+                                        }
+                                    }),
+                                )
+                                .child(styled)
+                                // Painted after the text so the caret can ask the
+                                // finished layout where the cursor index landed.
+                                .child(canvas(
+                                    |_, _, _| (),
+                                    move |_, _, window, _| {
+                                        if let Some(position) = layout.position_for_index(cursor) {
+                                            window.paint_quad(fill(
+                                                gpui::Bounds::new(
+                                                    position,
+                                                    size(px(2.), layout.line_height()),
+                                                ),
+                                                theme::accent(),
+                                            ));
+                                        }
+                                    },
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("save-desc")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(theme::accent().opacity(0.4))
+                                        .bg(theme::accent().opacity(0.1))
+                                        .text_xs()
+                                        .text_color(theme::accent())
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(theme::accent().opacity(0.18)))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.save_desc_edit(cx);
+                                        }))
+                                        .child("Save"),
+                                )
+                                .child(
+                                    div()
+                                        .id("cancel-desc")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(theme::border())
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(theme::surface_hover()))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.cancel_desc_edit(cx);
+                                        }))
+                                        .child("Cancel"),
+                                ),
+                        )
+                }
+                None => section.child(
+                    div()
+                        .text_sm()
+                        .line_height(relative(1.45))
+                        .text_color(theme::text())
+                        .child(if issue.description.is_empty() {
+                            "No description.".into()
+                        } else {
+                            issue.description.clone()
+                        }),
+                ),
+            })
+    }
+
+    fn star_button(&self, epic: &Issue, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let id = epic.id.clone();
+        let starred = epic.starred();
+        div()
+            .id(SharedString::from(format!("star:{}", epic.id)))
+            .flex_none()
+            .text_sm()
+            .text_color(if starred {
+                theme::star()
+            } else {
+                theme::muted().opacity(0.5)
+            })
+            .cursor_pointer()
+            .hover(|style| style.text_color(theme::star()))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.toggle_star(id.clone(), starred, cx);
+            }))
+            .child(if starred { "★" } else { "☆" })
+    }
+
     fn epic_card(
         &self,
         summary: &EpicSummary,
@@ -1238,6 +2223,7 @@ impl Dashboard {
                     .gap_2()
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.select(epic_id.clone(), cx)))
+                    .child(self.star_button(&summary.epic, cx))
                     .child(
                         div()
                             .text_xs()
@@ -1337,7 +2323,11 @@ impl Dashboard {
             })
     }
 
-    fn closed_card(&self, issues: Vec<&Issue>, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn closed_card(
+        &self,
+        events: Vec<ClosedEvent<'_>>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         div()
             .w_full()
             .max_w(px(900.))
@@ -1355,18 +2345,25 @@ impl Dashboard {
                     .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme::text())
-                    .child("Recently closed"),
+                    .child("Recent completions"),
             )
-            .children(issues.into_iter().map(|issue| {
+            .children(events.into_iter().map(|event| {
+                let issue = event.issue();
                 let id = issue.id.clone();
-                let closed_at = issue
-                    .closed_at
-                    .as_deref()
-                    .or(issue.updated_at.as_deref())
-                    .map(format_closed_at)
-                    .unwrap_or_else(|| "Unknown date".into());
+                let menu_id = issue.id.clone();
+                let menu_open = self.closed_menu_for.as_deref() == Some(issue.id.as_str());
+                let event_kind = if event.is_epic_completion() {
+                    "epic-complete"
+                } else {
+                    "closed"
+                };
+                let completed_at = if event.timestamp().is_empty() {
+                    "Unknown date".into()
+                } else {
+                    format_closed_at(event.timestamp())
+                };
                 div()
-                    .id(SharedString::from(format!("closed:{}", issue.id)))
+                    .id(SharedString::from(format!("{event_kind}:{}", issue.id)))
                     .w_full()
                     .px_2()
                     .py_2()
@@ -1377,13 +2374,22 @@ impl Dashboard {
                     .cursor_pointer()
                     .hover(|style| style.bg(theme::surface_hover()))
                     .on_click(cx.listener(move |this, _, _, cx| this.select(id.clone(), cx)))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.closed_menu_for = Some(menu_id.clone());
+                            cx.notify();
+                        }),
+                    )
+                    .when(menu_open, |row| row.child(self.closed_row_menu(&issue.id, cx)))
                     .child(
                         div()
                             .w(px(116.))
                             .flex_none()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(closed_at),
+                            .child(completed_at),
                     )
                     .child(
                         div()
@@ -1403,7 +2409,11 @@ impl Dashboard {
                             .text_color(theme::text())
                             .child(issue.title.clone()),
                     )
-                    .child(self.state_badge_editable(issue, "closed", cx))
+                    .child(if event.is_epic_completion() {
+                        self.badge("✓ EPIC COMPLETE", theme::ready()).into_any_element()
+                    } else {
+                        self.state_badge_editable(issue, "closed", cx).into_any_element()
+                    })
             }))
     }
 
@@ -2689,29 +3699,7 @@ impl Dashboard {
                                 )
                             }),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::muted())
-                                    .child("DESCRIPTION"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .line_height(relative(1.45))
-                                    .text_color(theme::text())
-                                    .child(if issue.description.is_empty() {
-                                        "No description.".into()
-                                    } else {
-                                        issue.description.clone()
-                                    }),
-                            ),
-                    )
+                    .child(self.description_section(issue, cx))
                     .when_some(issue.assignee.clone(), |panel, assignee| {
                         panel.child(
                             div()
@@ -2910,33 +3898,62 @@ impl Render for Dashboard {
             .iter()
             .zip(epic_anchors)
             .filter(|(epic, _)| {
-                (self.issue_matches_filter(&epic.epic)
-                    && (query.is_empty() || issue_matches(&epic.epic, &query)))
-                    || epic.children.iter().any(|issue| {
-                        self.issue_matches_filter(issue)
-                            && (query.is_empty() || issue_matches(issue, &query))
-                    })
+                (!self.starred_only || epic.epic.starred())
+                    && ((self.issue_matches_filter(&epic.epic)
+                        && (query.is_empty() || issue_matches(&epic.epic, &query)))
+                        || epic.children.iter().any(|issue| {
+                            self.issue_matches_filter(issue)
+                                && (query.is_empty() || issue_matches(issue, &query))
+                        }))
             })
             .collect();
-        let show_ungrouped = self.data.ungrouped.iter().any(|issue| {
-            self.issue_matches_filter(issue) && (query.is_empty() || issue_matches(issue, &query))
-        });
-        let mut closed_issues: Vec<_> = self
+        // Starring is an epic-level concept, so the loose-beads card sits out
+        // of starred-only mode entirely.
+        let show_ungrouped = !self.starred_only
+            && self.data.ungrouped.iter().any(|issue| {
+                self.issue_matches_filter(issue)
+                    && (query.is_empty() || issue_matches(issue, &query))
+            });
+        // The closed view is an event stream, not just a status query. An epic
+        // completion is inferred when all of its child beads are closed; the
+        // epic itself can (and normally does) remain open.
+        let mut closed_events: Vec<_> = self
             .data
             .issues
             .iter()
             .filter(|issue| {
-                issue.status == "closed" && (query.is_empty() || issue_matches(issue, &query))
+                issue.status == "closed"
+                    && (query.is_empty() || issue_matches(issue, &query))
+                    // A completed epic gets one richer completion event rather
+                    // than a duplicate literal CLOSED row.
+                    && !(issue.issue_type == "epic"
+                        && self
+                            .data
+                            .epics
+                            .iter()
+                            .any(|summary| summary.epic.id == issue.id && summary.is_complete()))
             })
+            .map(ClosedEvent::Issue)
+            .chain(
+                self.data
+                    .epics
+                    .iter()
+                    .filter(|summary| {
+                        summary.is_complete()
+                            && (query.is_empty() || issue_matches(&summary.epic, &query))
+                    })
+                    .map(ClosedEvent::EpicCompleted),
+            )
             .collect();
-        closed_issues.sort_by(|left, right| {
-            closure_time(right)
-                .cmp(closure_time(left))
-                .then_with(|| right.id.cmp(&left.id))
+        closed_events.sort_by(|left, right| {
+            right
+                .timestamp()
+                .cmp(left.timestamp())
+                .then_with(|| right.issue().id.cmp(&left.issue().id))
         });
-        closed_issues.truncate(100);
+        closed_events.truncate(100);
         let has_results = if self.filter == DashboardFilter::Closed {
-            !closed_issues.is_empty()
+            !closed_events.is_empty()
         } else {
             !visible_epics.is_empty() || show_ungrouped
         };
@@ -3031,6 +4048,53 @@ impl Render for Dashboard {
                                 DashboardFilter::Closed,
                                 cx,
                             ))
+                            .child(self.starred_toggle(cx))
+                            .child(
+                                div()
+                                    .id("open-designer")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .cursor_pointer()
+                                    .hover(|style| {
+                                        style
+                                            .bg(theme::surface_hover())
+                                            .text_color(theme::accent())
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_designer(window, cx)
+                                    }))
+                                    .child("✎ designer"),
+                            )
+                            .when(!self.chats.is_empty() && !self.chat_open, |toolbar| {
+                                let count = self.chats.len();
+                                toolbar.child(
+                                    div()
+                                        .id("reopen-chats")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(theme::accent().opacity(0.35))
+                                        .text_xs()
+                                        .text_color(theme::accent())
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(theme::accent().opacity(0.1)))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            let index = this.active_chat.min(
+                                                this.chats.len().saturating_sub(1),
+                                            );
+                                            this.activate_chat(index, window, cx);
+                                        }))
+                                        .child(if count == 1 {
+                                            "1 chat".to_owned()
+                                        } else {
+                                            format!("{count} chats")
+                                        }),
+                                )
+                            })
                             .child(div().flex_1())
                             .when(self.search_open || !query.is_empty(), |toolbar| {
                                 toolbar.child(
@@ -3143,7 +4207,7 @@ impl Render for Dashboard {
                                     })
                                     .when(
                                         self.filter == DashboardFilter::Closed && has_results,
-                                        |grid| grid.child(self.closed_card(closed_issues, cx)),
+                                        |grid| grid.child(self.closed_card(closed_events, cx)),
                                     )
                                     .when(!has_results, |grid| {
                                         grid.child(
@@ -3179,6 +4243,12 @@ impl Render for Dashboard {
             .when_some(selected, |root, issue| {
                 root.child(self.inspector(&issue, bottom_inspector, inspector_height, cx))
             })
+            .when_some(
+                self.chat_open
+                    .then(|| self.chats.get(self.active_chat).cloned())
+                    .flatten(),
+                |root, chat| root.child(self.chat_panel(chat, bottom_inspector, cx)),
+            )
             .when(!self.completed_toast.is_empty(), |root| {
                 root.child(self.completion_toast(cx))
             })
@@ -3221,6 +4291,75 @@ fn format_closed_at(timestamp: &str) -> String {
     match (timestamp.get(..10), timestamp.get(11..16)) {
         (Some(date), Some(time)) => format!("{date} {time}"),
         _ => timestamp.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DescEdit;
+
+    fn edit(buffer: &str, cursor: usize) -> DescEdit {
+        let mut edit = DescEdit::new("x".into(), buffer.into());
+        edit.cursor = cursor;
+        edit
+    }
+
+    #[test]
+    fn editing_stays_on_char_boundaries() {
+        let mut edit = edit("héllo", 5);
+        edit.backspace();
+        assert_eq!(edit.buffer, "hélo");
+        edit.move_left();
+        edit.move_left();
+        assert_eq!(edit.cursor, 1);
+        edit.insert("ü");
+        assert_eq!(edit.buffer, "hüélo");
+        edit.delete();
+        assert_eq!(edit.buffer, "hülo");
+        edit.move_right();
+        edit.insert("!");
+        assert_eq!(edit.buffer, "hül!o");
+    }
+
+    #[test]
+    fn selection_replaces_collapses_and_normalizes_direction() {
+        let mut edit = edit("hello world", 6);
+        // Drag backwards: anchor right of cursor still yields a forward range.
+        edit.set_cursor(6, false);
+        edit.anchor = Some(6);
+        edit.set_cursor(0, true);
+        assert_eq!(edit.selection(), Some(0..6));
+        assert_eq!(edit.selected_text().as_deref(), Some("hello "));
+        edit.insert("bye ");
+        assert_eq!(edit.buffer, "bye world");
+        assert_eq!(edit.cursor, 4);
+        assert_eq!(edit.selection(), None);
+
+        edit.select_all();
+        edit.backspace();
+        assert_eq!(edit.buffer, "");
+
+        // Plain left/right collapse a selection to its edge instead of moving.
+        let mut collapse = DescEdit::new("x".into(), "abc".into());
+        collapse.cursor = 0;
+        collapse.set_cursor(2, true);
+        collapse.move_right();
+        assert_eq!((collapse.cursor, collapse.selection()), (2, None));
+    }
+
+    #[test]
+    fn vertical_moves_keep_the_column_and_clamp_short_lines() {
+        let mut edit = edit("first line\nlonger second\nab", 4);
+        edit.move_vertical(false);
+        assert_eq!(&edit.buffer[edit.cursor..edit.cursor + 2], "er");
+        edit.move_vertical(false);
+        // Third line is shorter than the column; cursor clamps to its end.
+        assert_eq!(edit.cursor, edit.buffer.len());
+        edit.move_vertical(true);
+        edit.move_vertical(true);
+        assert_eq!(edit.cursor, 2);
+        edit.move_vertical(true);
+        assert_eq!(edit.cursor, 0, "up from the first line goes to the start");
     }
 }
 
